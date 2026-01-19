@@ -3,38 +3,52 @@ import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "25mb" }));
 
-/* ================= ENV CHECK ================= */
-if (
-  !process.env.SUPABASE_URL ||
-  !process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  !process.env.GEMINI_API_KEY
-) {
-  console.error("❌ Missing environment variables");
-  process.exit(1);
+/* ------------------------------------------------ */
+/* ENV CHECK                                        */
+/* ------------------------------------------------ */
+const REQUIRED_ENVS = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "GEMINI_API_KEY",
+];
+
+for (const key of REQUIRED_ENVS) {
+  if (!process.env[key]) {
+    console.error(`❌ Missing env var: ${key}`);
+    process.exit(1);
+  }
 }
 
-/* ================= SUPABASE ================= */
+/* ------------------------------------------------ */
+/* CLIENTS                                          */
+/* ------------------------------------------------ */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ================= GEMINI ================= */
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
 
-/* ================= HEALTH ================= */
+/* ------------------------------------------------ */
+/* HEALTH CHECK                                     */
+/* ------------------------------------------------ */
 app.get("/", (_, res) => {
   res.status(200).send("OK");
 });
 
-/* ================= WORKER ================= */
+/* ------------------------------------------------ */
+/* JOB PROCESSOR                                    */
+/* ------------------------------------------------ */
 app.post("/process", async (req, res) => {
   const { job_id } = req.body;
-  if (!job_id) return res.status(400).send("MISSING_JOB_ID");
+
+  if (!job_id) {
+    return res.status(400).send("MISSING_JOB_ID");
+  }
 
   const { data: job, error } = await supabase
     .from("ai_jobs")
@@ -42,7 +56,9 @@ app.post("/process", async (req, res) => {
     .eq("id", job_id)
     .single();
 
-  if (error || !job) return res.sendStatus(404);
+  if (error || !job) {
+    return res.sendStatus(404);
+  }
 
   await supabase
     .from("ai_jobs")
@@ -58,7 +74,7 @@ app.post("/process", async (req, res) => {
         break;
 
       default:
-        throw new Error("UNKNOWN_JOB_TYPE");
+        throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
     }
 
     await supabase
@@ -71,7 +87,7 @@ app.post("/process", async (req, res) => {
 
     return res.sendStatus(200);
   } catch (err) {
-    console.error(err);
+    console.error("❌ JOB FAILED", err);
 
     await supabase
       .from("ai_jobs")
@@ -85,37 +101,45 @@ app.post("/process", async (req, res) => {
   }
 });
 
-/* ================= START ================= */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`✅ Worker running on port ${PORT}`);
-});
-
-/* ================================================= */
-/* =============== GEMINI IMAGE ==================== */
-/* ================================================= */
-
+/* ------------------------------------------------ */
+/* IMAGE GENERATION (CRITICAL FIX APPLIED)           */
+/* ------------------------------------------------ */
 async function generateImage(input) {
-  const parts = [{ text: input.prompt }];
+  const parts = [];
 
-  // ✅ reference image (THIS is what fixes your issue)
-  if (input.referenceImage) {
-    const match = input.referenceImage.match(
-      /^data:(image\/\w+);base64,(.+)$/
-    );
+  /* 1️⃣ REFERENCE IMAGE FIRST (MANDATORY) */
+  if (input.referenceImages?.length) {
+    for (const img of input.referenceImages) {
+      const match = img.match(/^data:(image\/\w+);base64,(.+)$/);
+      if (!match) continue;
 
-    if (!match) throw new Error("INVALID_IMAGE_FORMAT");
-
-    parts.push({
-      inlineData: {
-        mimeType: match[1],
-        data: match[2], // base64 only
-      },
-    });
+      parts.push({
+        inlineData: {
+          mimeType: match[1],
+          data: match[2], // base64 ONLY
+        },
+      });
+    }
   }
 
+  /* 2️⃣ STRONGLY BOUND PROMPT */
+  parts.push({
+    text: `
+You are given a REFERENCE IMAGE of an existing building.
+
+STRICT RULES (DO NOT VIOLATE):
+- Preserve EXACT geometry, massing, proportions, and façade layout
+- Do NOT invent a new building
+- Do NOT change structure
+- ONLY adjust lighting, atmosphere, materials, and realism
+
+TASK:
+${input.prompt}
+`,
+  });
+
   const res = await ai.models.generateContent({
-    model: input.config.model, // gemini-2.5-flash-image
+    model: input.config.model, // e.g. gemini-3-pro-image-preview
     contents: { parts },
     config: {
       imageConfig: {
@@ -142,3 +166,11 @@ async function generateImage(input) {
     imageUrl: `data:image/png;base64,${imageBase64}`,
   };
 }
+
+/* ------------------------------------------------ */
+/* SERVER START                                     */
+/* ------------------------------------------------ */
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`✅ Gemini worker running on port ${PORT}`);
+});
