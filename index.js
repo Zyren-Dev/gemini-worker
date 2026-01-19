@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
 
 const app = express();
+app.use(express.json({ limit: "25mb" }));
 
 /* ------------------------------------------------ */
 /* ENV CHECK                                        */
@@ -33,6 +34,18 @@ const ai = new GoogleGenAI({
 });
 
 /* ------------------------------------------------ */
+/* HARD TIMEOUT HELPER (FIX #1)                      */
+/* ------------------------------------------------ */
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("GENERATION_TIMEOUT")), ms)
+    ),
+  ]);
+}
+
+/* ------------------------------------------------ */
 /* HEALTH CHECK                                     */
 /* ------------------------------------------------ */
 app.get("/", (_, res) => res.status(200).send("OK"));
@@ -43,6 +56,7 @@ app.get("/", (_, res) => res.status(200).send("OK"));
 async function generateImage(input) {
   const parts = [];
 
+  // 1️⃣ Reference image FIRST
   if (input.referenceImages?.length) {
     for (const img of input.referenceImages) {
       const m = img.match(/^data:(image\/\w+);base64,(.+)$/);
@@ -57,6 +71,7 @@ async function generateImage(input) {
     }
   }
 
+  // 2️⃣ Prompt AFTER image
   parts.push({
     text: `
 You are given a REFERENCE IMAGE of an existing building.
@@ -94,58 +109,64 @@ ${input.prompt}
 }
 
 /* ------------------------------------------------ */
-/* JOB LOOP (FIXED)                                 */
+/* JOB PROCESSOR                                    */
 /* ------------------------------------------------ */
-async function jobLoop() {
-  while (true) {
-    const { data: job, error } = await supabase.rpc("claim_next_ai_job");
+app.post("/process", async (req, res) => {
+  const { job_id } = req.body;
 
-    if (error) {
-      console.error("❌ Failed to claim job", error);
-      await new Promise(r => setTimeout(r, 2000));
-      continue;
+  if (!job_id) return res.status(400).send("MISSING_JOB_ID");
+
+  const { data: job } = await supabase
+    .from("ai_jobs")
+    .select("*")
+    .eq("id", job_id)
+    .single();
+
+  if (!job) return res.sendStatus(404);
+
+  await supabase
+    .from("ai_jobs")
+    .update({ status: "processing" })
+    .eq("id", job_id);
+
+  try {
+    let result;
+
+    if (job.type === "generate-image") {
+      // 🔥 FIX #1 APPLIED HERE
+      result = await withTimeout(
+        generateImage(job.input),
+        90_000 // 90 seconds max
+      );
+    } else {
+      throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
     }
 
-    if (!job) {
-      await new Promise(r => setTimeout(r, 1500));
-      continue;
-    }
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "completed",
+        result,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", job_id);
 
-    const { id, type, input } = job;
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error("❌ JOB FAILED", err);
 
-    try {
-      let result;
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "failed",
+        error: String(err),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", job_id);
 
-      if (type === "generate-image") {
-        result = await generateImage(input);
-      } else {
-        throw new Error(`UNKNOWN_JOB_TYPE: ${type}`);
-      }
-
-      await supabase
-        .from("ai_jobs")
-        .update({
-          status: "completed",
-          result,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id);
-
-      console.log(`✅ Job ${id} completed`);
-    } catch (err) {
-      console.error("❌ JOB FAILED", err);
-
-      await supabase
-        .from("ai_jobs")
-        .update({
-          status: "failed",
-          error: String(err),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id);
-    }
+    return res.sendStatus(500);
   }
-}
+});
 
 /* ------------------------------------------------ */
 /* START                                            */
@@ -153,5 +174,4 @@ async function jobLoop() {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Gemini worker running on port ${PORT}`);
-  jobLoop();
 });
