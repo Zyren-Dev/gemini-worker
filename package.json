@@ -1,0 +1,9 @@
+{
+  "name": "gemini-worker",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "@google/generative-ai": "^0.7.0",
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
