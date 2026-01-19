@@ -43,7 +43,6 @@ app.get("/", (_, res) => res.status(200).send("OK"));
 async function generateImage(input) {
   const parts = [];
 
-  // 🔑 reference image FIRST
   if (input.referenceImages?.length) {
     for (const img of input.referenceImages) {
       const m = img.match(/^data:(image\/\w+);base64,(.+)$/);
@@ -95,18 +94,24 @@ ${input.prompt}
 }
 
 /* ------------------------------------------------ */
-/* JOB LOOP (THE FIX)                               */
+/* JOB LOOP (FIXED)                                 */
 /* ------------------------------------------------ */
 async function jobLoop() {
   while (true) {
-    const { data: job } = await supabase.rpc("claim_next_ai_job");
+    const { data: job, error } = await supabase.rpc("claim_next_ai_job");
 
-    if (!job || job.length === 0) {
+    if (error) {
+      console.error("❌ Failed to claim job", error);
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+
+    if (!job) {
       await new Promise(r => setTimeout(r, 1500));
       continue;
     }
 
-    const { id, type, input } = job[0];
+    const { id, type, input } = job;
 
     try {
       let result;
@@ -125,6 +130,8 @@ async function jobLoop() {
           updated_at: new Date().toISOString(),
         })
         .eq("id", id);
+
+      console.log(`✅ Job ${id} completed`);
     } catch (err) {
       console.error("❌ JOB FAILED", err);
 
@@ -146,5 +153,5 @@ async function jobLoop() {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Gemini worker running on port ${PORT}`);
-  jobLoop(); // 🔥 START WORKER LOOP
+  jobLoop();
 });
