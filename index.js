@@ -1,5 +1,4 @@
 import express from "express";
-import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
@@ -32,6 +31,11 @@ app.post("/process", async (req, res) => {
 
   if (error || !job) {
     return res.sendStatus(404);
+  }
+
+  // 🔒 idempotency guard
+  if (job.status !== "pending") {
+    return res.sendStatus(200);
   }
 
   await supabase
@@ -69,6 +73,17 @@ app.post("/process", async (req, res) => {
 
     return res.sendStatus(200);
   } catch (err) {
+    console.error("JOB FAILED", err);
+
+    // 🔁 refund credits
+    await supabase.rpc("refund_credits", {
+      p_amount: job.cost,
+      p_metadata: {
+        job_id: job.id,
+        reason: "generation_failed",
+      },
+    });
+
     await supabase
       .from("ai_jobs")
       .update({
@@ -92,16 +107,16 @@ app.listen(PORT, () => {
 /* ================================================= */
 
 async function generateImage(input) {
-  // call Gemini Image API here
+  // Gemini image generation here
   return { imageUrl: "data:image/png;base64,..." };
 }
 
 async function generateVideo(input) {
-  // call Veo here
+  // Veo video generation here
   return { videoUrl: "data:video/mp4;base64,..." };
 }
 
 async function analyzeMaterial(input) {
-  // call Gemini analysis here
+  // Gemini analysis here
   return { material: "Concrete", confidence: 0.93 };
 }
