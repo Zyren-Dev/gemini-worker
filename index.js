@@ -3,7 +3,6 @@ import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
 
 /* ------------------------------------------------ */
 /* ENV CHECK                                        */
@@ -36,102 +35,37 @@ const ai = new GoogleGenAI({
 /* ------------------------------------------------ */
 /* HEALTH CHECK                                     */
 /* ------------------------------------------------ */
-app.get("/", (_, res) => {
-  res.status(200).send("OK");
-});
+app.get("/", (_, res) => res.status(200).send("OK"));
 
 /* ------------------------------------------------ */
-/* JOB PROCESSOR                                    */
-/* ------------------------------------------------ */
-app.post("/process", async (req, res) => {
-  const { job_id } = req.body;
-
-  if (!job_id) {
-    return res.status(400).send("MISSING_JOB_ID");
-  }
-
-  const { data: job, error } = await supabase
-    .from("ai_jobs")
-    .select("*")
-    .eq("id", job_id)
-    .single();
-
-  if (error || !job) {
-    return res.sendStatus(404);
-  }
-
-  await supabase
-    .from("ai_jobs")
-    .update({ status: "processing" })
-    .eq("id", job_id);
-
-  try {
-    let result;
-
-    switch (job.type) {
-      case "generate-image":
-        result = await generateImage(job.input);
-        break;
-
-      default:
-        throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
-    }
-
-    await supabase
-      .from("ai_jobs")
-      .update({
-        status: "completed",
-        result,
-      })
-      .eq("id", job_id);
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("❌ JOB FAILED", err);
-
-    await supabase
-      .from("ai_jobs")
-      .update({
-        status: "failed",
-        error: String(err),
-      })
-      .eq("id", job_id);
-
-    return res.sendStatus(500);
-  }
-});
-
-/* ------------------------------------------------ */
-/* IMAGE GENERATION (CRITICAL FIX APPLIED)           */
+/* IMAGE GENERATION                                 */
 /* ------------------------------------------------ */
 async function generateImage(input) {
   const parts = [];
 
-  /* 1️⃣ REFERENCE IMAGE FIRST (MANDATORY) */
+  // 🔑 reference image FIRST
   if (input.referenceImages?.length) {
     for (const img of input.referenceImages) {
-      const match = img.match(/^data:(image\/\w+);base64,(.+)$/);
-      if (!match) continue;
-
-      parts.push({
-        inlineData: {
-          mimeType: match[1],
-          data: match[2], // base64 ONLY
-        },
-      });
+      const m = img.match(/^data:(image\/\w+);base64,(.+)$/);
+      if (m) {
+        parts.push({
+          inlineData: {
+            mimeType: m[1],
+            data: m[2],
+          },
+        });
+      }
     }
   }
 
-  /* 2️⃣ STRONGLY BOUND PROMPT */
   parts.push({
     text: `
 You are given a REFERENCE IMAGE of an existing building.
 
-STRICT RULES (DO NOT VIOLATE):
-- Preserve EXACT geometry, massing, proportions, and façade layout
+STRICT RULES:
+- Preserve geometry, massing, proportions
 - Do NOT invent a new building
-- Do NOT change structure
-- ONLY adjust lighting, atmosphere, materials, and realism
+- Only adjust lighting, realism, materials
 
 TASK:
 ${input.prompt}
@@ -139,7 +73,7 @@ ${input.prompt}
   });
 
   const res = await ai.models.generateContent({
-    model: input.config.model, // e.g. gemini-3-pro-image-preview
+    model: input.config.model,
     contents: { parts },
     config: {
       imageConfig: {
@@ -149,28 +83,68 @@ ${input.prompt}
     },
   });
 
-  let imageBase64;
-
   for (const part of res.candidates?.[0]?.content?.parts ?? []) {
     if (part.inlineData) {
-      imageBase64 = part.inlineData.data;
-      break;
+      return {
+        imageUrl: `data:image/png;base64,${part.inlineData.data}`,
+      };
     }
   }
 
-  if (!imageBase64) {
-    throw new Error("NO_IMAGE_RETURNED");
-  }
-
-  return {
-    imageUrl: `data:image/png;base64,${imageBase64}`,
-  };
+  throw new Error("NO_IMAGE_RETURNED");
 }
 
 /* ------------------------------------------------ */
-/* SERVER START                                     */
+/* JOB LOOP (THE FIX)                               */
+/* ------------------------------------------------ */
+async function jobLoop() {
+  while (true) {
+    const { data: job } = await supabase.rpc("claim_next_ai_job");
+
+    if (!job || job.length === 0) {
+      await new Promise(r => setTimeout(r, 1500));
+      continue;
+    }
+
+    const { id, type, input } = job[0];
+
+    try {
+      let result;
+
+      if (type === "generate-image") {
+        result = await generateImage(input);
+      } else {
+        throw new Error(`UNKNOWN_JOB_TYPE: ${type}`);
+      }
+
+      await supabase
+        .from("ai_jobs")
+        .update({
+          status: "completed",
+          result,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", id);
+    } catch (err) {
+      console.error("❌ JOB FAILED", err);
+
+      await supabase
+        .from("ai_jobs")
+        .update({
+          status: "failed",
+          error: String(err),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", id);
+    }
+  }
+}
+
+/* ------------------------------------------------ */
+/* START                                            */
 /* ------------------------------------------------ */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Gemini worker running on port ${PORT}`);
+  jobLoop(); // 🔥 START WORKER LOOP
 });
