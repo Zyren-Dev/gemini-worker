@@ -1,189 +1,107 @@
 import express from "express";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import fetch from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "20mb" }));
 
-/* ------------------------------------------------------------------ */
-/* Gemini client                                                       */
-/* ------------------------------------------------------------------ */
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+/* ---------------- SUPABASE CLIENT ---------------- */
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-/* ------------------------------------------------------------------ */
-/* Health check (optional but useful)                                  */
-/* ------------------------------------------------------------------ */
+/* ---------------- HEALTH CHECK ---------------- */
 app.get("/", (req, res) => {
-  res.status(200).send("OK");
+  res.send("OK");
 });
 
-/* ------------------------------------------------------------------ */
-/* Main worker endpoint                                                */
-/* ------------------------------------------------------------------ */
+/* ---------------- JOB PROCESSOR ---------------- */
 app.post("/process", async (req, res) => {
+  const { job_id } = req.body;
+
+  if (!job_id) {
+    return res.status(400).send("MISSING_JOB_ID");
+  }
+
+  const { data: job, error } = await supabase
+    .from("ai_jobs")
+    .select("*")
+    .eq("id", job_id)
+    .single();
+
+  if (error || !job) {
+    return res.sendStatus(404);
+  }
+
+  await supabase
+    .from("ai_jobs")
+    .update({ status: "processing" })
+    .eq("id", job_id);
+
   try {
-    const { action, payload, user_id } = req.body;
+    let result;
 
-    if (!action || !payload) {
-      return res.status(400).json({ error: "INVALID_REQUEST" });
+    switch (job.type) {
+      case "generate-image":
+        result = await generateImage(job.input);
+        break;
+
+      case "generate-video":
+        result = await generateVideo(job.input);
+        break;
+
+      case "analyze-material":
+        result = await analyzeMaterial(job.input);
+        break;
+
+      default:
+        throw new Error("UNKNOWN_JOB_TYPE");
     }
 
-    console.log("ACTION:", action, "USER:", user_id ?? "unknown");
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "completed",
+        result,
+      })
+      .eq("id", job_id);
 
-    /* =============================================================== */
-    /* IMAGE GENERATION                                                */
-    /* =============================================================== */
-    if (action === "generate-image") {
-      const model = genAI.getGenerativeModel({
-        model: payload.config.model,
-      });
-
-      const parts = [{ text: payload.prompt }];
-
-      if (payload.referenceImages?.length) {
-        for (const img of payload.referenceImages) {
-          const match = img.match(/^data:([^;]+);base64,(.+)$/);
-          if (match) {
-            parts.push({
-              inlineData: {
-                mimeType: match[1],
-                data: match[2],
-              },
-            });
-          }
-        }
-      }
-
-      const result = await model.generateContent({
-        contents: [{ role: "user", parts }],
-        generationConfig: {
-          imageConfig: {
-            aspectRatio: payload.config.aspectRatio,
-            imageSize: payload.config.imageSize,
-          },
-        },
-      });
-
-      let imageUrl = "";
-
-      const contentParts =
-        result?.response?.candidates?.[0]?.content?.parts ?? [];
-
-      for (const part of contentParts) {
-        if (part.inlineData) {
-          imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-          break;
-        }
-      }
-
-      if (!imageUrl) {
-        throw new Error("IMAGE_GENERATION_FAILED");
-      }
-
-      return res.json({ imageUrl });
-    }
-
-    /* =============================================================== */
-    /* VIDEO GENERATION                                                */
-    /* =============================================================== */
-    if (action === "generate-video") {
-      let operation = await genAI.models.generateVideos({
-        model: payload.config.model,
-        prompt: payload.prompt,
-        config: {
-          resolution: payload.config.resolution,
-          aspectRatio: payload.config.aspectRatio,
-          numberOfVideos: 1,
-        },
-      });
-
-      while (!operation.done) {
-        await new Promise((r) => setTimeout(r, 10_000));
-        operation = await genAI.operations.getVideosOperation({
-          operation,
-        });
-      }
-
-      const uri =
-        operation?.response?.generatedVideos?.[0]?.video?.uri;
-
-      if (!uri) {
-        throw new Error("VIDEO_GENERATION_FAILED");
-      }
-
-      const videoRes = await fetch(`${uri}&key=${process.env.GEMINI_API_KEY}`);
-      const buffer = await videoRes.arrayBuffer();
-      const base64 = Buffer.from(buffer).toString("base64");
-
-      return res.json({
-        videoData: `data:video/mp4;base64,${base64}`,
-      });
-    }
-
-    /* =============================================================== */
-    /* IMAGE ANALYSIS                                                  */
-    /* =============================================================== */
-    if (action === "analyze-material") {
-      const model = genAI.getGenerativeModel({
-        model: "gemini-3-flash-preview",
-      });
-
-      const match = payload.image.match(/^data:([^;]+);base64,(.+)$/);
-      if (!match) {
-        return res.status(400).json({ error: "INVALID_IMAGE" });
-      }
-
-      const result = await model.generateContent({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                inlineData: {
-                  mimeType: match[1],
-                  data: match[2],
-                },
-              },
-              {
-                text: `Analyze this image and return STRICT JSON exactly like this:
-{
-  "name": "string",
-  "description": "string",
-  "color": "string",
-  "category": "string"
-}`,
-              },
-            ],
-          },
-        ],
-      });
-
-      const text = result?.response?.text?.();
-      if (!text) {
-        throw new Error("ANALYSIS_FAILED");
-      }
-
-      return res.json({
-        analysis: JSON.parse(text),
-      });
-    }
-
-    /* =============================================================== */
-    /* UNKNOWN ACTION                                                  */
-    /* =============================================================== */
-    return res.status(400).json({ error: "UNKNOWN_ACTION" });
+    return res.sendStatus(200);
   } catch (err) {
-    console.error("WORKER ERROR:", err);
-    return res.status(500).json({
-      error: "WORKER_EXECUTION_FAILED",
-      message: err?.message ?? "Unknown error",
-    });
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "failed",
+        error: String(err),
+      })
+      .eq("id", job_id);
+
+    return res.sendStatus(500);
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* Start server                                                        */
-/* ------------------------------------------------------------------ */
+/* ---------------- SERVER START ---------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log("Gemini worker running on port", PORT);
+  console.log(`Worker running on port ${PORT}`);
 });
+
+/* ================================================= */
+/* IMPLEMENT THESE FUNCTIONS BELOW                   */
+/* ================================================= */
+
+async function generateImage(input) {
+  // call Gemini Image API here
+  return { imageUrl: "data:image/png;base64,..." };
+}
+
+async function generateVideo(input) {
+  // call Veo here
+  return { videoUrl: "data:video/mp4;base64,..." };
+}
+
+async function analyzeMaterial(input) {
+  // call Gemini analysis here
+  return { material: "Concrete", confidence: 0.93 };
+}
