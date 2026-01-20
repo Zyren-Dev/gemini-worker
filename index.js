@@ -5,21 +5,15 @@ import { GoogleGenAI } from "@google/genai";
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
-/* ========================================================= */
-/* ENV CHECK                                                 */
-/* ========================================================= */
-["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GEMINI_API_KEY"].forEach(
-  (key) => {
-    if (!process.env[key]) {
-      console.error(`❌ Missing env var: ${key}`);
-      process.exit(1);
-    }
+/* ================= ENV CHECK ================= */
+["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GEMINI_API_KEY"].forEach(k => {
+  if (!process.env[k]) {
+    console.error(`❌ Missing env var ${k}`);
+    process.exit(1);
   }
-);
+});
 
-/* ========================================================= */
-/* CLIENTS                                                   */
-/* ========================================================= */
+/* ================= CLIENTS ================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -29,37 +23,37 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
 
-/* ========================================================= */
-/* HEALTH CHECK                                              */
-/* ========================================================= */
+/* ================= HEALTH ================= */
 app.get("/", (_, res) => res.send("OK"));
 
-/* ========================================================= */
-/* JOB WORKER                                                */
-/* ========================================================= */
+/* ================= WORKER ================= */
 app.post("/process", async (_, res) => {
-  let job;
+  let job = null;
 
   try {
-    /* 1️⃣ CLAIM ONE JOB */
-    const { data, error } = await supabase.rpc("claim_next_ai_job");
+    const rpc = await supabase.rpc("claim_next_ai_job");
 
-    if (error) throw error;
-    if (!data) return res.sendStatus(204);
-
-    job = data;
-    console.log(`▶ Processing job ${job.id}`);
-
-    /* 2️⃣ EXECUTE */
-    let result;
-
-    if (job.type === "generate-image") {
-      result = await generateImage(job);
-    } else {
-      throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
+    if (rpc.error) {
+      console.error("❌ claim_next_ai_job error", rpc.error);
+      return res.sendStatus(500);
     }
 
-    /* 3️⃣ COMPLETE */
+    if (!rpc.data) {
+      console.log("ℹ️ No pending jobs");
+      return res.sendStatus(204);
+    }
+
+    // 🔥 THIS IS THE CRITICAL FIX
+    job = Array.isArray(rpc.data) ? rpc.data[0] : rpc.data;
+
+    console.log("▶ Job claimed:", job.id);
+
+    if (job.type !== "generate-image") {
+      throw new Error(`Unsupported job type: ${job.type}`);
+    }
+
+    const result = await generateImage(job);
+
     await supabase
       .from("ai_jobs")
       .update({
@@ -72,7 +66,7 @@ app.post("/process", async (_, res) => {
     return res.sendStatus(200);
 
   } catch (err) {
-    console.error("🔥 Job failed", err);
+    console.error("🔥 Job failed HARD:", err);
 
     if (job?.id) {
       await supabase
@@ -88,38 +82,37 @@ app.post("/process", async (_, res) => {
   }
 });
 
-/* ========================================================= */
-/* IMAGE GENERATION                                          */
-/* ========================================================= */
+/* ================= IMAGE GENERATION ================= */
 async function generateImage(job) {
   const { input, user_id } = job;
-  const parts = [];
 
-  /* ---------- LOAD REFERENCE IMAGES ---------- */
-  if (input.referenceImagePaths?.length) {
-    for (const path of input.referenceImagePaths) {
-      const { data, error } = await supabase
-        .storage
-        .from("user_assets")
-        .download(path);
-
-      if (error) throw error;
-
-      const buffer = Buffer.from(await data.arrayBuffer());
-
-      parts.push({
-        inlineData: {
-          mimeType: "image/png",
-          data: buffer.toString("base64"),
-        },
-      });
-    }
+  if (!input?.prompt) {
+    throw new Error("INVALID_INPUT_PROMPT");
   }
 
-  /* ---------- PROMPT MUST BE LAST ---------- */
+  const parts = [];
+
+  // Reference images from storage
+  for (const path of input.referenceImagePaths ?? []) {
+    const { data, error } = await supabase
+      .storage
+      .from("user_assets")
+      .download(path);
+
+    if (error) throw error;
+
+    const buffer = Buffer.from(await data.arrayBuffer());
+
+    parts.push({
+      inlineData: {
+        mimeType: "image/png",
+        data: buffer.toString("base64"),
+      },
+    });
+  }
+
   parts.push({ text: input.prompt });
 
-  /* ---------- GEMINI CALL ---------- */
   const res = await ai.models.generateContent({
     model: input.config.model,
     contents: { parts },
@@ -132,37 +125,32 @@ async function generateImage(job) {
   });
 
   const imagePart =
-    res.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+    res.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
 
   if (!imagePart) {
     throw new Error("NO_IMAGE_RETURNED");
   }
 
-  /* ---------- UPLOAD RESULT ---------- */
   const imageBase64 = imagePart.inlineData.data;
   const filePath = `users/${user_id}/renders/${Date.now()}.png`;
 
-  const { error: uploadError } = await supabase.storage
+  await supabase.storage
     .from("user_assets")
-    .upload(filePath, Buffer.from(imageBase64, "base64"), {
-      contentType: "image/png",
-      upsert: false,
-    });
+    .upload(
+      filePath,
+      Buffer.from(imageBase64, "base64"),
+      { contentType: "image/png" }
+    );
 
-  if (uploadError) throw uploadError;
-
-  const { data: publicUrl } = supabase.storage
+  const { data: url } = supabase
+    .storage
     .from("user_assets")
     .getPublicUrl(filePath);
 
-  return {
-    imageUrl: publicUrl.publicUrl,
-  };
+  return { imageUrl: url.publicUrl };
 }
 
-/* ========================================================= */
-/* START SERVER                                              */
-/* ========================================================= */
+/* ================= START ================= */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Gemini worker running on port ${PORT}`);
