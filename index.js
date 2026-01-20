@@ -1,7 +1,7 @@
 import express from "express";
+import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
-import crypto from "crypto";
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -44,6 +44,7 @@ app.get("/", (_, res) => res.send("OK"));
 /* ========================================================= */
 app.post("/process", async (_, res) => {
   try {
+    /* 1️⃣ CLAIM ONE JOB */
     const { data: job, error } = await supabase.rpc("claim_next_ai_job");
 
     if (error) {
@@ -52,22 +53,24 @@ app.post("/process", async (_, res) => {
     }
 
     if (!job) {
-      return res.sendStatus(204);
+      return res.sendStatus(204); // no jobs
     }
 
     console.log(`▶ Processing job ${job.id}`);
 
+    /* 2️⃣ EXECUTE JOB */
     let result;
 
     switch (job.type) {
       case "generate-image":
-        result = await generateImage(job.input, job.user_id, job.id);
+        result = await generateImage(job);
         break;
 
       default:
-        throw new Error("UNKNOWN_JOB_TYPE");
+        throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
     }
 
+    /* 3️⃣ MARK COMPLETE */
     await supabase
       .from("ai_jobs")
       .update({
@@ -81,31 +84,58 @@ app.post("/process", async (_, res) => {
 
   } catch (err) {
     console.error("🔥 Job failed", err);
-
     return res.sendStatus(500);
   }
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION + STORAGE UPLOAD (ONLY CHANGE)           */
+/* IMAGE GENERATION (URL → BASE64 → GEMINI → STORAGE)        */
 /* ========================================================= */
-async function generateImage(input, userId, jobId) {
-  const parts = [{ text: input.prompt }];
+async function generateImage(job) {
+  const { input, user_id } = job;
+  const parts = [];
 
+  /* ---------- REFERENCE IMAGES ---------- */
   if (input.referenceImages?.length) {
-    for (const img of input.referenceImages) {
-      const match = img.match(/^data:(image\/\w+);base64,(.+)$/);
-      if (!match) continue;
+    for (const ref of input.referenceImages) {
 
-      parts.push({
-        inlineData: {
-          mimeType: match[1],
-          data: match[2],
-        },
-      });
+      // Base64 (legacy)
+      if (ref.startsWith("data:image")) {
+        const match = ref.match(/^data:(image\/\w+);base64,(.+)$/);
+        if (!match) continue;
+
+        parts.push({
+          inlineData: {
+            mimeType: match[1],
+            data: match[2],
+          },
+        });
+      }
+
+      // Supabase URL (current)
+      else if (ref.startsWith("http")) {
+        const response = await fetch(ref);
+        if (!response.ok) {
+          throw new Error("FAILED_TO_FETCH_REFERENCE_IMAGE");
+        }
+
+        const buffer = await response.arrayBuffer();
+        const base64 = Buffer.from(buffer).toString("base64");
+
+        parts.push({
+          inlineData: {
+            mimeType: response.headers.get("content-type") || "image/png",
+            data: base64,
+          },
+        });
+      }
     }
   }
 
+  /* ---------- PROMPT MUST BE LAST ---------- */
+  parts.push({ text: input.prompt });
+
+  /* ---------- GEMINI CALL ---------- */
   const res = await ai.models.generateContent({
     model: input.config.model,
     contents: { parts },
@@ -117,38 +147,39 @@ async function generateImage(input, userId, jobId) {
     },
   });
 
-  let imageBase64;
-  let mimeType = "image/png";
+  const imagePart = res.candidates?.[0]?.content?.parts?.find(
+    p => p.inlineData
+  );
 
-  for (const part of res.candidates?.[0]?.content?.parts ?? []) {
-    if (part.inlineData) {
-      imageBase64 = part.inlineData.data;
-      mimeType = part.inlineData.mimeType;
-      break;
-    }
-  }
-
-  if (!imageBase64) {
+  if (!imagePart) {
     throw new Error("NO_IMAGE_RETURNED");
   }
 
-  /* ---------- UPLOAD TO SUPABASE STORAGE ---------- */
-  const buffer = Buffer.from(imageBase64, "base64");
+  /* ---------- UPLOAD RESULT TO STORAGE ---------- */
+  const imageBase64 = imagePart.inlineData.data;
+  const mimeType = imagePart.inlineData.mimeType || "image/png";
+  const ext = mimeType.split("/")[1];
 
-  const filePath = `users/${userId}/renders/${jobId}-${crypto.randomUUID()}.png`;
+  const filePath = `users/${user_id}/renders/${Date.now()}.${ext}`;
 
-  const { error: uploadError } = await supabase.storage
+  const { error: uploadError } = await supabase
+    .storage
     .from("user_assets")
-    .upload(filePath, buffer, {
-      contentType: mimeType,
-      upsert: false,
-    });
+    .upload(
+      filePath,
+      Buffer.from(imageBase64, "base64"),
+      {
+        contentType: mimeType,
+        upsert: false,
+      }
+    );
 
   if (uploadError) {
     throw uploadError;
   }
 
-  const { data: publicUrl } = supabase.storage
+  const { data: publicUrl } = supabase
+    .storage
     .from("user_assets")
     .getPublicUrl(filePath);
 
@@ -162,5 +193,5 @@ async function generateImage(input, userId, jobId) {
 /* ========================================================= */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`🚀 Worker listening on port ${PORT}`);
+  console.log(`🚀 Gemini worker running on port ${PORT}`);
 });
