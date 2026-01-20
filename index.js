@@ -3,7 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 /* ========================================================= */
 /* ENV CHECK                                                 */
@@ -43,12 +43,8 @@ app.get("/", (_, res) => res.send("OK"));
 /* ========================================================= */
 app.post("/process", async (_, res) => {
   try {
-    /* --------------------------------------------- */
-    /* 1️⃣ ATOMICALLY CLAIM ONE PENDING JOB           */
-    /* --------------------------------------------- */
-    const { data: job, error } = await supabase.rpc(
-      "claim_next_ai_job"
-    );
+    /* 1️⃣ CLAIM JOB */
+    const { data: job, error } = await supabase.rpc("claim_next_ai_job");
 
     if (error) {
       console.error("❌ Failed to claim job", error);
@@ -56,42 +52,26 @@ app.post("/process", async (_, res) => {
     }
 
     if (!job) {
-      // No pending jobs → exit cleanly
-      return res.sendStatus(204);
+      return res.sendStatus(204); // No jobs
     }
 
     console.log(`▶ Processing job ${job.id}`);
 
-    /* --------------------------------------------- */
-    /* 2️⃣ EXECUTE JOB                                */
-    /* --------------------------------------------- */
-    let result;
+    /* 2️⃣ EXECUTE */
+    let renderPath: string | null = null;
 
-    switch (job.type) {
-      case "generate-image":
-        result = await generateImage(job.input);
-        break;
-
-      case "generate-video":
-        result = { video: "TODO" };
-        break;
-
-      case "analyze-material":
-        result = { analysis: "TODO" };
-        break;
-
-      default:
-        throw new Error("UNKNOWN_JOB_TYPE");
+    if (job.type === "generate-image") {
+      renderPath = await generateImage(job);
+    } else {
+      throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
     }
 
-    /* --------------------------------------------- */
-    /* 3️⃣ MARK COMPLETE                              */
-    /* --------------------------------------------- */
+    /* 3️⃣ MARK COMPLETE */
     await supabase
       .from("ai_jobs")
       .update({
         status: "completed",
-        result,
+        result: { render_path: renderPath },
       })
       .eq("id", job.id);
 
@@ -100,53 +80,60 @@ app.post("/process", async (_, res) => {
 
   } catch (err) {
     console.error("🔥 Job failed", err);
-
-    if (err?.job_id) {
-      await supabase
-        .from("ai_jobs")
-        .update({
-          status: "failed",
-          error: String(err),
-        })
-        .eq("id", err.job_id);
-    }
-
     return res.sendStatus(500);
   }
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION (REFERENCE IMAGE + PROMPT)               */
+/* IMAGE GENERATION (STORAGE → GEMINI → STORAGE)             */
 /* ========================================================= */
-async function generateImage(input) {
-  const parts = [{ text: input.prompt }];
+async function generateImage(job) {
+  const parts: any[] = [];
 
-  if (input.referenceImages?.length) {
-    for (const img of input.referenceImages) {
-      const match = img.match(/^data:(image\/\w+);base64,(.+)$/);
-      if (!match) continue;
+  /* --------------------------------------------- */
+  /* 1️⃣ LOAD REFERENCE IMAGES FROM STORAGE         */
+  /* --------------------------------------------- */
+  if (job.input.referenceImagePaths?.length) {
+    for (const path of job.input.referenceImagePaths) {
+      const { data, error } = await supabase.storage
+        .from("user_assets")
+        .download(path);
+
+      if (error || !data) {
+        throw new Error(`FAILED_TO_DOWNLOAD_REF: ${path}`);
+      }
+
+      const buffer = Buffer.from(await data.arrayBuffer());
 
       parts.push({
         inlineData: {
-          mimeType: match[1],
-          data: match[2],
+          mimeType: "image/png",
+          data: buffer.toString("base64"),
         },
       });
     }
   }
 
+  /* --------------------------------------------- */
+  /* 2️⃣ ADD PROMPT                                */
+  /* --------------------------------------------- */
+  parts.push({ text: job.input.prompt });
+
+  /* --------------------------------------------- */
+  /* 3️⃣ CALL GEMINI                               */
+  /* --------------------------------------------- */
   const res = await ai.models.generateContent({
-    model: input.config.model,
+    model: job.input.config.model,
     contents: { parts },
     config: {
       imageConfig: {
-        imageSize: input.config.imageSize,
-        aspectRatio: input.config.aspectRatio,
+        imageSize: job.input.config.imageSize,
+        aspectRatio: job.input.config.aspectRatio,
       },
     },
   });
 
-  let imageBase64;
+  let imageBase64: string | null = null;
   let mimeType = "image/png";
 
   for (const part of res.candidates?.[0]?.content?.parts ?? []) {
@@ -161,9 +148,25 @@ async function generateImage(input) {
     throw new Error("NO_IMAGE_RETURNED");
   }
 
-  return {
-    imageUrl: `data:${mimeType};base64,${imageBase64}`,
-  };
+  /* --------------------------------------------- */
+  /* 4️⃣ UPLOAD FINAL RENDER TO STORAGE             */
+  /* --------------------------------------------- */
+  const renderPath = `users/${job.user_id}/renders/${job.id}.png`;
+
+  const { error: uploadErr } = await supabase.storage
+    .from("user_assets")
+    .upload(
+      renderPath,
+      Buffer.from(imageBase64, "base64"),
+      {
+        contentType: mimeType,
+        upsert: true,
+      }
+    );
+
+  if (uploadErr) throw uploadErr;
+
+  return renderPath;
 }
 
 /* ========================================================= */
@@ -171,5 +174,5 @@ async function generateImage(input) {
 /* ========================================================= */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`🚀 Worker listening on port ${PORT}`);
+  console.log(`🚀 Gemini worker running on port ${PORT}`);
 });
