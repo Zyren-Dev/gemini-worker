@@ -44,7 +44,6 @@ app.get("/", (_, res) => res.send("OK"));
 /* ========================================================= */
 app.post("/process", async (_, res) => {
   try {
-    /* 1️⃣ CLAIM ONE JOB */
     const { data: job, error } = await supabase.rpc("claim_next_ai_job");
 
     if (error) {
@@ -53,24 +52,19 @@ app.post("/process", async (_, res) => {
     }
 
     if (!job) {
-      return res.sendStatus(204); // no jobs
+      return res.sendStatus(204);
     }
 
     console.log(`▶ Processing job ${job.id}`);
 
-    /* 2️⃣ EXECUTE JOB */
     let result;
 
-    switch (job.type) {
-      case "generate-image":
-        result = await generateImage(job);
-        break;
-
-      default:
-        throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
+    if (job.type === "generate-image") {
+      result = await generateImage(job);
+    } else {
+      throw new Error(`UNKNOWN_JOB_TYPE: ${job.type}`);
     }
 
-    /* 3️⃣ MARK COMPLETE */
     await supabase
       .from("ai_jobs")
       .update({
@@ -92,14 +86,15 @@ app.post("/process", async (_, res) => {
 /* IMAGE GENERATION (URL → BASE64 → GEMINI → STORAGE)        */
 /* ========================================================= */
 async function generateImage(job) {
-  const { input, user_id } = job;
+  const { input, user_id, id: job_id } = job;
+
   const parts = [];
 
-  /* ---------- REFERENCE IMAGES ---------- */
+  /* ---------- REFERENCE IMAGES FIRST (MANDATORY) ---------- */
   if (input.referenceImages?.length) {
     for (const ref of input.referenceImages) {
 
-      // Base64 (legacy)
+      // Base64 (legacy support)
       if (ref.startsWith("data:image")) {
         const match = ref.match(/^data:(image\/\w+);base64,(.+)$/);
         if (!match) continue;
@@ -112,7 +107,7 @@ async function generateImage(job) {
         });
       }
 
-      // Supabase URL (current)
+      // URL (Supabase storage)
       else if (ref.startsWith("http")) {
         const response = await fetch(ref);
         if (!response.ok) {
@@ -147,9 +142,8 @@ async function generateImage(job) {
     },
   });
 
-  const imagePart = res.candidates?.[0]?.content?.parts?.find(
-    p => p.inlineData
-  );
+  const imagePart =
+    res.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
 
   if (!imagePart) {
     throw new Error("NO_IMAGE_RETURNED");
@@ -160,17 +154,16 @@ async function generateImage(job) {
   const mimeType = imagePart.inlineData.mimeType || "image/png";
   const ext = mimeType.split("/")[1];
 
-  const filePath = `users/${user_id}/renders/${Date.now()}.${ext}`;
+  const filePath = `users/${user_id}/renders/${job_id}.${ext}`;
 
-  const { error: uploadError } = await supabase
-    .storage
+  const { error: uploadError } = await supabase.storage
     .from("user_assets")
     .upload(
       filePath,
       Buffer.from(imageBase64, "base64"),
       {
         contentType: mimeType,
-        upsert: false,
+        upsert: true,
       }
     );
 
@@ -178,13 +171,13 @@ async function generateImage(job) {
     throw uploadError;
   }
 
-  const { data: publicUrl } = supabase
+  const { data } = supabase
     .storage
     .from("user_assets")
     .getPublicUrl(filePath);
 
   return {
-    imageUrl: publicUrl.publicUrl,
+    imageUrl: data.publicUrl,
   };
 }
 
