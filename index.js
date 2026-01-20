@@ -2,6 +2,16 @@ import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
 
+/* ================= SAFETY ================= */
+process.on("uncaughtException", err => {
+  console.error("UNCAUGHT_EXCEPTION", err);
+});
+
+process.on("unhandledRejection", err => {
+  console.error("UNHANDLED_REJECTION", err);
+});
+
+/* ================= APP ================= */
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
@@ -30,7 +40,9 @@ const ai = new GoogleGenAI({
 });
 
 /* ================= HEALTH ================= */
-app.get("/", (_, res) => res.send("OK"));
+app.get("/", (_, res) => {
+  res.status(200).send("OK");
+});
 
 /* ================= PROCESS JOB ================= */
 app.post("/process", async (req, res) => {
@@ -42,7 +54,7 @@ app.post("/process", async (req, res) => {
       return res.status(400).send("MISSING_JOB_ID");
     }
 
-    /* ---------- FETCH & LOCK JOB ---------- */
+    /* ---------- FETCH JOB ---------- */
     const { data, error } = await supabase
       .from("ai_jobs")
       .select("*")
@@ -51,12 +63,13 @@ app.post("/process", async (req, res) => {
       .single();
 
     if (error || !data) {
-      console.warn("ℹ️ Job not found or already processed:", job_id);
+      console.warn("ℹ️ Job not found or already handled:", job_id);
       return res.sendStatus(204);
     }
 
     job = data;
 
+    /* ---------- LOCK JOB ---------- */
     await supabase
       .from("ai_jobs")
       .update({ status: "processing" })
@@ -82,7 +95,7 @@ app.post("/process", async (req, res) => {
     return res.sendStatus(200);
 
   } catch (err) {
-    console.error("🔥 JOB FAILED:", err);
+    console.error("🔥 JOB FAILED", err);
 
     if (job?.id) {
       const safeError =
@@ -139,7 +152,7 @@ async function generateImage(job: any) {
   /* ---------- PROMPT ---------- */
   parts.push({ text: input.prompt });
 
-  /* ---------- GEMINI CALL (FORCE IMAGE OUTPUT) ---------- */
+  /* ---------- GEMINI IMAGE GENERATION ---------- */
   const response = await ai.models.generateContent({
     model: input.config.model,
     contents: [{ parts }],
@@ -159,7 +172,7 @@ async function generateImage(job: any) {
 
   const imageBase64 = imagePart.inlineData.data;
 
-  /* ---------- STORE RESULT ---------- */
+  /* ---------- STORE IMAGE ---------- */
   const filePath = `users/${user_id}/renders/${Date.now()}.png`;
 
   const upload = await supabase.storage
@@ -184,8 +197,9 @@ async function generateImage(job: any) {
   };
 }
 
-/* ================= START ================= */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 AI worker running on port ${PORT}`);
+/* ================= START SERVER ================= */
+const PORT = Number(process.env.PORT) || 8080;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Gemini worker listening on port ${PORT}`);
 });
