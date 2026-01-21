@@ -213,7 +213,7 @@ async function generateImage(job) {
   /* --------------------------------------------- */
   const { data, error } = await supabase.storage
     .from("user_assets")
-    .createSignedUrl(path, 60 * 60 * 24);
+    .createSignedUrl(path, 60 * 5);
 
   if (error) throw error;
 
@@ -229,4 +229,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Worker listening on port ${PORT}`);
 });
+
 
