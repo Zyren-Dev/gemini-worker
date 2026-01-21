@@ -13,6 +13,7 @@ const REQUIRED_ENVS = [
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
   "GEMINI_API_KEY",
+  "WORKER_SECRET", // 🔐 NEW
 ];
 
 for (const key of REQUIRED_ENVS) {
@@ -40,9 +41,15 @@ const ai = new GoogleGenAI({
 app.get("/", (_, res) => res.send("OK"));
 
 /* ========================================================= */
-/* JOB WORKER ENDPOINT                                       */
+/* JOB WORKER ENDPOINT (PROTECTED)                           */
 /* ========================================================= */
-app.post("/process", async (_, res) => {
+app.post("/process", async (req, res) => {
+  // 🔐 WORKER SECRET CHECK
+  if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
+    console.warn("🚫 Unauthorized worker call blocked");
+    return res.sendStatus(401);
+  }
+
   let job;
 
   try {
@@ -158,9 +165,6 @@ async function generateImage(job) {
     }
   }
 
-  /* --------------------------------------------- */
-  /* BUILD REQUEST (FLASH MODELS ARE STRICT)       */
-  /* --------------------------------------------- */
   const request = {
     model,
     contents: { parts },
@@ -209,7 +213,7 @@ async function generateImage(job) {
   if (uploadError) throw uploadError;
 
   /* --------------------------------------------- */
-  /* SIGNED URL (24h)                              */
+  /* SIGNED URL (5 min)                            */
   /* --------------------------------------------- */
   const { data, error } = await supabase.storage
     .from("user_assets")
@@ -229,5 +233,3 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Worker listening on port ${PORT}`);
 });
-
-
