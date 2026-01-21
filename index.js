@@ -4,7 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import crypto from "crypto";
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 /* ========================================================= */
 /* ENV CHECK                                                 */
@@ -13,7 +13,7 @@ const REQUIRED_ENVS = [
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
   "GEMINI_API_KEY",
-  "WORKER_SECRET", // 🔐 NEW
+  "WORKER_SECRET",
 ];
 
 for (const key of REQUIRED_ENVS) {
@@ -44,9 +44,7 @@ app.get("/", (_, res) => res.send("OK"));
 /* JOB WORKER ENDPOINT (PROTECTED)                           */
 /* ========================================================= */
 app.post("/process", async (req, res) => {
-  // 🔐 WORKER SECRET CHECK
   if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
-    console.warn("🚫 Unauthorized worker call blocked");
     return res.sendStatus(401);
   }
 
@@ -100,8 +98,6 @@ app.post("/process", async (req, res) => {
     /* ❌ GEMINI OVERLOAD → CANCEL + REFUND           */
     /* --------------------------------------------- */
     if (status === 503 && job) {
-      console.warn("💸 Gemini overloaded — cancelling & refunding");
-
       const { data: cancelledJob } = await supabase
         .from("ai_jobs")
         .update({
@@ -113,12 +109,12 @@ app.post("/process", async (req, res) => {
         .select()
         .single();
 
-      if (!cancelledJob) return res.sendStatus(200);
-
-      await supabase.rpc("refund_user_credits", {
-        p_user_id: job.user_id,
-        p_credits: job.credits_used,
-      });
+      if (cancelledJob) {
+        await supabase.rpc("refund_user_credits", {
+          p_user_id: job.user_id,
+          p_credits: job.credits_used,
+        });
+      }
 
       return res.sendStatus(200);
     }
@@ -141,7 +137,7 @@ app.post("/process", async (req, res) => {
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION + STORAGE (FLASH SAFE)                   */
+/* IMAGE GENERATION (INPUT FROM STORAGE)                     */
 /* ========================================================= */
 async function generateImage(job) {
   const input = job.input;
@@ -151,26 +147,37 @@ async function generateImage(job) {
 
   const parts = [{ text: input.prompt }];
 
+  /* --------------------------------------------- */
+  /* LOAD REFERENCE IMAGES FROM STORAGE             */
+  /* --------------------------------------------- */
   if (input.referenceImages?.length) {
-    for (const img of input.referenceImages) {
-      const match = img.match(/^data:(image\/\w+);base64,(.+)$/);
-      if (!match) continue;
+    for (const ref of input.referenceImages) {
+      const { data, error } = await supabase.storage
+        .from(ref.bucket)
+        .download(ref.path);
+
+      if (error) throw error;
+
+      const buffer = Buffer.from(await data.arrayBuffer());
+      const base64 = buffer.toString("base64");
 
       parts.push({
         inlineData: {
-          mimeType: match[1],
-          data: match[2],
+          mimeType: ref.mime,
+          data: base64,
         },
       });
     }
   }
 
+  /* --------------------------------------------- */
+  /* BUILD GEMINI REQUEST                           */
+  /* --------------------------------------------- */
   const request = {
     model,
     contents: { parts },
   };
 
-  // ❗ Flash image models do NOT accept imageConfig
   if (!model.toLowerCase().includes("flash")) {
     request.config = {
       imageConfig: {
@@ -196,25 +203,20 @@ async function generateImage(job) {
   if (!imageBase64) throw new Error("NO_IMAGE_RETURNED");
 
   /* --------------------------------------------- */
-  /* STORE IN PRIVATE BUCKET                       */
+  /* STORE OUTPUT IMAGE                             */
   /* --------------------------------------------- */
   const buffer = Buffer.from(imageBase64, "base64");
   const ext = mimeType.split("/")[1] || "png";
   const fileName = `${crypto.randomUUID()}.${ext}`;
   const path = `users/${job.user_id}/renders/${fileName}`;
 
-  const { error: uploadError } = await supabase.storage
+  await supabase.storage
     .from("user_assets")
     .upload(path, buffer, {
       contentType: mimeType,
       upsert: false,
     });
 
-  if (uploadError) throw uploadError;
-
-  /* --------------------------------------------- */
-  /* SIGNED URL (5 min)                            */
-  /* --------------------------------------------- */
   const { data, error } = await supabase.storage
     .from("user_assets")
     .createSignedUrl(path, 60 * 5);
