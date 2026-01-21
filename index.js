@@ -38,10 +38,14 @@ app.get("/", (_, res) => res.send("OK"));
 /* ========================================================= */
 
 /**
- * Exponential Backoff Utility
+ * Enhanced Exponential Backoff Utility
  * Retries the AI call if the model is overloaded (503) or rate limited (429).
+ * Pro models get a longer window and more attempts because they are higher demand.
  */
-async function callGeminiWithRetry(fn, maxRetries = 3) {
+async function callGeminiWithRetry(fn, isPro = false) {
+  const maxRetries = isPro ? 6 : 3; 
+  const baseDelay = isPro ? 4000 : 2000;
+  
   let lastError;
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -50,14 +54,18 @@ async function callGeminiWithRetry(fn, maxRetries = 3) {
       lastError = err;
       const status = err?.status || err?.response?.status;
       
-      // Only retry on transient errors (503: Overloaded, 429: Rate Limit)
+      // Retry on transient errors (503: Overloaded, 429: Rate Limit)
       if (status === 503 || status === 429) {
-        const delay = Math.pow(2, i) * 2000; // 2s, 4s, 8s
-        console.warn(`⏳ Neural Node busy (Status ${status}). Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries})`);
+        // Exponential backoff with jitter to prevent collision
+        const jitter = Math.random() * 1000;
+        const delay = (Math.pow(2, i) * baseDelay) + jitter;
+        
+        console.warn(`⏳ [Attempt ${i + 1}/${maxRetries}] Neural Node (${isPro ? 'Pro' : 'Flash'}) busy: ${status}. Retrying in ${Math.round(delay)}ms...`);
+        
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
-      // Hard failure (400, 401, 403, 404, etc.) - break loop
+      // Critical error (400, 401, etc.) - do not retry
       throw err;
     }
   }
@@ -102,7 +110,7 @@ app.post("/process", async (req, res) => {
       console.log(`♻️ Refunding user ${job.user_id} due to persistent 503 error.`);
       await supabase
         .from("ai_jobs")
-        .update({ status: "cancelled", error: "Engine saturated - credits restored." })
+        .update({ status: "cancelled", error: "Engine saturated - credits restored automatically." })
         .eq("id", job.id);
 
       await supabase.rpc("refund_user_credits", {
@@ -131,7 +139,8 @@ async function generateImage(job) {
   let model = input.config.model;
 
   // Normalize model string
-  if (model.includes("pro")) {
+  const isPro = model.includes("pro");
+  if (isPro) {
     model = "gemini-3-pro-image-preview";
   } else {
     model = "gemini-2.5-flash-image";
@@ -152,7 +161,6 @@ async function generateImage(job) {
   }
 
   /* Configuration Matrix */
-  const isPro = model.includes("pro");
   const config = {
     imageConfig: {
       aspectRatio: input.config.aspectRatio || "1:1",
@@ -165,13 +173,14 @@ async function generateImage(job) {
     config.imageConfig.imageSize = size;
   }
 
-  /* Execution with Retry logic */
+  /* Execution with Patient Retry logic for Pro */
   const response = await callGeminiWithRetry(() => 
     ai.models.generateContent({
       model,
       contents: { parts },
       config
-    })
+    }),
+    isPro
   );
 
   let imageBase64;
