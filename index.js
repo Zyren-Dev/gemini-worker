@@ -1,6 +1,7 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -26,7 +27,7 @@ for (const key of REQUIRED_ENVS) {
 /* ========================================================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 const ai = new GoogleGenAI({
@@ -44,7 +45,7 @@ app.get("/", (_, res) => res.send("OK"));
 app.post("/process", async (_, res) => {
   try {
     /* --------------------------------------------- */
-    /* 1️⃣ ATOMICALLY CLAIM ONE PENDING JOB           */
+    /* 1️⃣ CLAIM NEXT JOB                            */
     /* --------------------------------------------- */
     const { data: job, error } = await supabase.rpc("claim_next_ai_job");
 
@@ -53,37 +54,25 @@ app.post("/process", async (_, res) => {
       return res.sendStatus(500);
     }
 
-    if (!job) {
-      // No pending jobs → exit cleanly
-      return res.sendStatus(204);
-    }
+    if (!job) return res.sendStatus(204);
 
     console.log(`▶ Processing job ${job.id}`);
 
     /* --------------------------------------------- */
-    /* 2️⃣ EXECUTE JOB                                */
+    /* 2️⃣ EXECUTE JOB                               */
     /* --------------------------------------------- */
     let result;
 
     switch (job.type) {
       case "generate-image":
-        result = await generateImage(job.input);
+        result = await generateImage(job);
         break;
-
-      case "generate-video":
-        result = { video: "TODO" };
-        break;
-
-      case "analyze-material":
-        result = { analysis: "TODO" };
-        break;
-
       default:
         throw new Error("UNKNOWN_JOB_TYPE");
     }
 
     /* --------------------------------------------- */
-    /* 3️⃣ MARK COMPLETE                              */
+    /* 3️⃣ MARK JOB COMPLETE                         */
     /* --------------------------------------------- */
     await supabase
       .from("ai_jobs")
@@ -97,25 +86,16 @@ app.post("/process", async (_, res) => {
     return res.sendStatus(200);
   } catch (err) {
     console.error("🔥 Job failed", err);
-
-    if (err?.job_id) {
-      await supabase
-        .from("ai_jobs")
-        .update({
-          status: "failed",
-          error: String(err),
-        })
-        .eq("id", err.job_id);
-    }
-
     return res.sendStatus(500);
   }
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION (REFERENCE IMAGE + PROMPT)               */
+/* IMAGE GENERATION → PRIVATE STORAGE → SIGNED URL           */
 /* ========================================================= */
-async function generateImage(input) {
+async function generateImage(job) {
+  const input = job.input;
+
   const parts = [{ text: input.prompt }];
 
   if (input.referenceImages?.length) {
@@ -158,8 +138,50 @@ async function generateImage(input) {
     throw new Error("NO_IMAGE_RETURNED");
   }
 
+  /* --------------------------------------------- */
+  /* CONVERT BASE64 → BUFFER                       */
+  /* --------------------------------------------- */
+  const buffer = Buffer.from(imageBase64, "base64");
+  const extension = mimeType.split("/")[1] || "png";
+
+  /* --------------------------------------------- */
+  /* BUILD STORAGE PATH                            */
+  /* --------------------------------------------- */
+  const fileName = `${crypto.randomUUID()}.${extension}`;
+  const storagePath = `${job.user_id}/${fileName}`;
+
+  /* --------------------------------------------- */
+  /* UPLOAD TO PRIVATE BUCKET                      */
+  /* --------------------------------------------- */
+  const { error: uploadError } = await supabase.storage
+    .from("user_assets")
+    .upload(storagePath, buffer, {
+      contentType: mimeType,
+      upsert: false,
+    });
+
+  if (uploadError) {
+    console.error("❌ Upload failed", uploadError);
+    throw new Error("STORAGE_UPLOAD_FAILED");
+  }
+
+  /* --------------------------------------------- */
+  /* CREATE SIGNED URL (PRIVATE ACCESS)            */
+  /* --------------------------------------------- */
+  const { data, error } = await supabase.storage
+    .from("user_assets")
+    .createSignedUrl(storagePath, 60 * 60 * 24); // 24 hours
+
+  if (error) {
+    console.error("❌ Signed URL failed", error);
+    throw new Error("SIGNED_URL_FAILED");
+  }
+
+  /* --------------------------------------------- */
+  /* RETURN URL → STORED IN ai_jobs.result         */
+  /* --------------------------------------------- */
   return {
-    imageUrl: `data:${mimeType};base64,${imageBase64}`,
+    image_url: data.signedUrl,
   };
 }
 
