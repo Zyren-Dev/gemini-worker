@@ -95,7 +95,6 @@ app.post("/process", async (_, res) => {
     if (status === 503 && job) {
       console.warn("💸 Gemini overloaded — cancelling & refunding");
 
-      // 1️⃣ Cancel job ONLY if still processing
       const { data: cancelledJob } = await supabase
         .from("ai_jobs")
         .update({
@@ -107,12 +106,8 @@ app.post("/process", async (_, res) => {
         .select()
         .single();
 
-      if (!cancelledJob) {
-        // Already handled (prevents double refund)
-        return res.sendStatus(200);
-      }
+      if (!cancelledJob) return res.sendStatus(200);
 
-      // 2️⃣ Refund credits (atomic RPC)
       await supabase.rpc("refund_user_credits", {
         p_user_id: job.user_id,
         p_credits: job.credits_used,
@@ -122,7 +117,7 @@ app.post("/process", async (_, res) => {
     }
 
     /* --------------------------------------------- */
-    /* ❌ HARD FAILURE (NO REFUND)                   */
+    /* ❌ HARD FAILURE                               */
     /* --------------------------------------------- */
     if (job) {
       await supabase
@@ -139,12 +134,13 @@ app.post("/process", async (_, res) => {
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION + STORAGE                                */
+/* IMAGE GENERATION + STORAGE (FLASH SAFE)                   */
 /* ========================================================= */
 async function generateImage(job) {
   const input = job.input;
+  const model = input.config.model;
 
-  console.log("🧠 Model:", input.config.model);
+  console.log("🧠 Model:", model);
 
   const parts = [{ text: input.prompt }];
 
@@ -162,16 +158,25 @@ async function generateImage(job) {
     }
   }
 
-  const response = await ai.models.generateContent({
-    model: input.config.model,
+  /* --------------------------------------------- */
+  /* BUILD REQUEST (FLASH MODELS ARE STRICT)       */
+  /* --------------------------------------------- */
+  const request = {
+    model,
     contents: { parts },
-    config: {
+  };
+
+  // ❗ Flash image models do NOT accept imageConfig
+  if (!model.toLowerCase().includes("flash")) {
+    request.config = {
       imageConfig: {
         imageSize: input.config.imageSize,
         aspectRatio: input.config.aspectRatio,
       },
-    },
-  });
+    };
+  }
+
+  const response = await ai.models.generateContent(request);
 
   let imageBase64;
   let mimeType = "image/png";
