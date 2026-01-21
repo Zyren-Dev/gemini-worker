@@ -32,7 +32,7 @@ const supabase = createClient(
 );
 
 const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+  apiKey: process.env.API_KEY,
 });
 
 /* ========================================================= */
@@ -235,4 +235,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Worker listening on port ${PORT}`);
 });
+
 
