@@ -90,38 +90,8 @@ app.post("/process", async (req, res) => {
     return res.sendStatus(200);
 
   } catch (err) {
-    const status = err?.status || err?.response?.status;
-
     console.error("🔥 Job error", err);
 
-    /* --------------------------------------------- */
-    /* ❌ GEMINI OVERLOAD → CANCEL + REFUND           */
-    /* --------------------------------------------- */
-    if (status === 503 && job) {
-      const { data: cancelledJob } = await supabase
-        .from("ai_jobs")
-        .update({
-          status: "cancelled",
-          error: "Model overloaded — credits refunded",
-        })
-        .eq("id", job.id)
-        .eq("status", "processing")
-        .select()
-        .single();
-
-      if (cancelledJob) {
-        await supabase.rpc("refund_user_credits", {
-          p_user_id: job.user_id,
-          p_credits: job.credits_used,
-        });
-      }
-
-      return res.sendStatus(200);
-    }
-
-    /* --------------------------------------------- */
-    /* ❌ HARD FAILURE                               */
-    /* --------------------------------------------- */
     if (job) {
       await supabase
         .from("ai_jobs")
@@ -137,7 +107,7 @@ app.post("/process", async (req, res) => {
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION (INPUT FROM STORAGE)                     */
+/* IMAGE GENERATION (DOC-CORRECT)                            */
 /* ========================================================= */
 async function generateImage(job) {
   const input = job.input;
@@ -145,7 +115,9 @@ async function generateImage(job) {
 
   console.log("🧠 Model:", model);
 
-  const parts = [{ text: input.prompt }];
+  const parts = [
+    { text: input.prompt }
+  ];
 
   /* --------------------------------------------- */
   /* LOAD REFERENCE IMAGES FROM STORAGE             */
@@ -159,26 +131,30 @@ async function generateImage(job) {
       if (error) throw error;
 
       const buffer = Buffer.from(await data.arrayBuffer());
-      const base64 = buffer.toString("base64");
 
       parts.push({
         inlineData: {
           mimeType: ref.mime,
-          data: base64,
+          data: buffer.toString("base64"),
         },
       });
     }
   }
 
   /* --------------------------------------------- */
-  /* BUILD GEMINI REQUEST (PRO-SAFE)                */
+  /* BUILD GEMINI REQUEST (SPEC COMPLIANT)          */
   /* --------------------------------------------- */
   const request = {
     model,
-    contents: { parts },
+    contents: [
+      {
+        role: "user",
+        parts,
+      },
+    ],
   };
 
-  // ✅ ONLY Flash supports imageConfig safely
+  // ⚠️ Flash ONLY
   if (model.toLowerCase().includes("flash")) {
     request.config = {
       imageConfig: {
@@ -201,7 +177,9 @@ async function generateImage(job) {
     }
   }
 
-  if (!imageBase64) throw new Error("NO_IMAGE_RETURNED");
+  if (!imageBase64) {
+    throw new Error("NO_IMAGE_RETURNED");
+  }
 
   /* --------------------------------------------- */
   /* STORE OUTPUT IMAGE                             */
