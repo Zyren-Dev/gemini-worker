@@ -197,7 +197,7 @@ async function generateImage(job) {
   const buffer = Buffer.from(imageBase64, "base64");
   const ext = mimeType.split("/")[1] || "png";
   const fileName = `${crypto.randomUUID()}.${ext}`;
-  const path = `${job.user_id}/${fileName}`;
+  const path = `users/${job.user_id}/renders/${fileName}`;
 
   const { error: uploadError } = await supabase.storage
     .from("user_assets")
@@ -229,3 +229,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Worker listening on port ${PORT}`);
 });
+
