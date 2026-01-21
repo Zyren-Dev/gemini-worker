@@ -171,14 +171,15 @@ async function generateImage(job) {
   }
 
   /* --------------------------------------------- */
-  /* BUILD GEMINI REQUEST                           */
+  /* BUILD GEMINI REQUEST (PRO-SAFE)                */
   /* --------------------------------------------- */
   const request = {
     model,
     contents: { parts },
   };
 
-  if (!model.toLowerCase().includes("flash")) {
+  // ✅ ONLY Flash supports imageConfig safely
+  if (model.toLowerCase().includes("flash")) {
     request.config = {
       imageConfig: {
         imageSize: input.config.imageSize,
