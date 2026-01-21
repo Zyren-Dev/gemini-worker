@@ -51,9 +51,6 @@ app.post("/process", async (req, res) => {
   let job;
 
   try {
-    /* --------------------------------------------- */
-    /* 1️⃣ CLAIM JOB                                 */
-    /* --------------------------------------------- */
     const { data, error } = await supabase.rpc("claim_next_ai_job");
 
     if (error) {
@@ -66,18 +63,12 @@ app.post("/process", async (req, res) => {
     job = data;
     console.log(`▶ Processing job ${job.id}`);
 
-    /* --------------------------------------------- */
-    /* 2️⃣ EXECUTE JOB                               */
-    /* --------------------------------------------- */
     if (job.type !== "generate-image") {
       throw new Error("UNKNOWN_JOB_TYPE");
     }
 
     const result = await generateImage(job);
 
-    /* --------------------------------------------- */
-    /* 3️⃣ COMPLETE JOB                              */
-    /* --------------------------------------------- */
     await supabase
       .from("ai_jobs")
       .update({
@@ -115,102 +106,9 @@ async function generateImage(job) {
 
   console.log("🧠 Model:", model);
 
-  const parts = [
-    { text: input.prompt }
-  ];
+  const parts = [{ text: input.prompt }];
 
   /* --------------------------------------------- */
   /* LOAD REFERENCE IMAGES FROM STORAGE             */
   /* --------------------------------------------- */
-  if (input.referenceImages?.length) {
-    for (const ref of input.referenceImages) {
-      const { data, error } = await supabase.storage
-        .from(ref.bucket)
-        .download(ref.path);
-
-      if (error) throw error;
-
-      const buffer = Buffer.from(await data.arrayBuffer());
-
-      parts.push({
-        inlineData: {
-          mimeType: ref.mime,
-          data: buffer.toString("base64"),
-        },
-      });
-    }
-  }
-
-  /* --------------------------------------------- */
-  /* BUILD GEMINI REQUEST (SPEC COMPLIANT)          */
-  /* --------------------------------------------- */
-  const request = {
-    model,
-    contents: [
-      {
-        role: "user",
-        parts,
-      },
-    ],
-  };
-
-  // ⚠️ Flash ONLY
-  if (model.toLowerCase().includes("flash")) {
-    request.config = {
-      imageConfig: {
-        imageSize: input.config.imageSize,
-        aspectRatio: input.config.aspectRatio,
-      },
-    };
-  }
-
-  const response = await ai.models.generateContent(request);
-
-  let imageBase64;
-  let mimeType = "image/png";
-
-  for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-    if (part.inlineData) {
-      imageBase64 = part.inlineData.data;
-      mimeType = part.inlineData.mimeType;
-      break;
-    }
-  }
-
-  if (!imageBase64) {
-    throw new Error("NO_IMAGE_RETURNED");
-  }
-
-  /* --------------------------------------------- */
-  /* STORE OUTPUT IMAGE                             */
-  /* --------------------------------------------- */
-  const buffer = Buffer.from(imageBase64, "base64");
-  const ext = mimeType.split("/")[1] || "png";
-  const fileName = `${crypto.randomUUID()}.${ext}`;
-  const path = `users/${job.user_id}/renders/${fileName}`;
-
-  await supabase.storage
-    .from("user_assets")
-    .upload(path, buffer, {
-      contentType: mimeType,
-      upsert: false,
-    });
-
-  const { data, error } = await supabase.storage
-    .from("user_assets")
-    .createSignedUrl(path, 60 * 5);
-
-  if (error) throw error;
-
-  return {
-    image_url: data.signedUrl,
-  };
-}
-
-/* ========================================================= */
-/* SERVER START                                              */
-/* ========================================================= */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Worker listening on port ${PORT}`);
-});
+  if (input.referenceImages?.length
