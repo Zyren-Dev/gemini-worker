@@ -12,7 +12,7 @@ app.use(express.json({ limit: "5mb" }));
 const REQUIRED_ENVS = [
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
-  "GEMINI_API_KEY",
+  "API_KEY",
   "WORKER_SECRET",
 ];
 
@@ -235,3 +235,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Worker listening on port ${PORT}`);
 });
+
