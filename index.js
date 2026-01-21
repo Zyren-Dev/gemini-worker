@@ -66,13 +66,13 @@ app.post("/process", async (req, res) => {
     job = data;
     console.log(`▶ Processing job ${job.id}`);
 
+    /* --------------------------------------------- */
+    /* 2️⃣ EXECUTE JOB                               */
+    /* --------------------------------------------- */
     if (job.type !== "generate-image") {
       throw new Error("UNKNOWN_JOB_TYPE");
     }
 
-    /* --------------------------------------------- */
-    /* 2️⃣ EXECUTE JOB                               */
-    /* --------------------------------------------- */
     const result = await generateImage(job);
 
     /* --------------------------------------------- */
@@ -90,8 +90,38 @@ app.post("/process", async (req, res) => {
     return res.sendStatus(200);
 
   } catch (err) {
+    const status = err?.status || err?.response?.status;
+
     console.error("🔥 Job error", err);
 
+    /* --------------------------------------------- */
+    /* ❌ GEMINI OVERLOAD → CANCEL + REFUND           */
+    /* --------------------------------------------- */
+    if (status === 503 && job) {
+      const { data: cancelledJob } = await supabase
+        .from("ai_jobs")
+        .update({
+          status: "cancelled",
+          error: "Model overloaded — credits refunded",
+        })
+        .eq("id", job.id)
+        .eq("status", "processing")
+        .select()
+        .single();
+
+      if (cancelledJob) {
+        await supabase.rpc("refund_user_credits", {
+          p_user_id: job.user_id,
+          p_credits: job.credits_used,
+        });
+      }
+
+      return res.sendStatus(200);
+    }
+
+    /* --------------------------------------------- */
+    /* ❌ HARD FAILURE                               */
+    /* --------------------------------------------- */
     if (job) {
       await supabase
         .from("ai_jobs")
@@ -107,7 +137,7 @@ app.post("/process", async (req, res) => {
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION (GEMINI DOC-CORRECT)                     */
+/* IMAGE GENERATION (INPUT FROM STORAGE)                     */
 /* ========================================================= */
 async function generateImage(job) {
   const input = job.input;
@@ -115,15 +145,10 @@ async function generateImage(job) {
 
   console.log("🧠 Model:", model);
 
-  /* --------------------------------------------- */
-  /* BUILD CONTENT PARTS                           */
-  /* --------------------------------------------- */
-  const parts = [
-    { text: input.prompt }
-  ];
+  const parts = [{ text: input.prompt }];
 
   /* --------------------------------------------- */
-  /* LOAD REFERENCE IMAGES (PRIVATE STORAGE)       */
+  /* LOAD REFERENCE IMAGES FROM STORAGE             */
   /* --------------------------------------------- */
   if (input.referenceImages?.length) {
     for (const ref of input.referenceImages) {
@@ -134,37 +159,26 @@ async function generateImage(job) {
       if (error) throw error;
 
       const buffer = Buffer.from(await data.arrayBuffer());
+      const base64 = buffer.toString("base64");
 
       parts.push({
         inlineData: {
           mimeType: ref.mime,
-          data: buffer.toString("base64"),
+          data: base64,
         },
       });
     }
   }
 
   /* --------------------------------------------- */
-  /* BUILD GEMINI REQUEST (STRICT SPEC)            */
+  /* BUILD GEMINI REQUEST                           */
   /* --------------------------------------------- */
   const request = {
     model,
-    contents: parts, // ⚠️ NOT chat format
+    contents: { parts },
   };
 
-  // ✅ Gemini 3 Pro REQUIREMENTS
-  if (model === "gemini-3-pro-image-preview") {
-    request.config = {
-      responseModalities: ["TEXT", "IMAGE"], // 🔴 REQUIRED
-      imageConfig: {
-        imageSize: input.config.imageSize,
-        aspectRatio: input.config.aspectRatio,
-      },
-    };
-  }
-
-  // ✅ Flash models (more permissive)
-  if (model.includes("flash")) {
+  if (!model.toLowerCase().includes("flash")) {
     request.config = {
       imageConfig: {
         imageSize: input.config.imageSize,
@@ -173,9 +187,6 @@ async function generateImage(job) {
     };
   }
 
-  /* --------------------------------------------- */
-  /* CALL GEMINI                                   */
-  /* --------------------------------------------- */
   const response = await ai.models.generateContent(request);
 
   let imageBase64;
@@ -189,12 +200,10 @@ async function generateImage(job) {
     }
   }
 
-  if (!imageBase64) {
-    throw new Error("NO_IMAGE_RETURNED");
-  }
+  if (!imageBase64) throw new Error("NO_IMAGE_RETURNED");
 
   /* --------------------------------------------- */
-  /* STORE OUTPUT IMAGE                            */
+  /* STORE OUTPUT IMAGE                             */
   /* --------------------------------------------- */
   const buffer = Buffer.from(imageBase64, "base64");
   const ext = mimeType.split("/")[1] || "png";
