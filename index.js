@@ -8,28 +8,14 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 /* ========================================================= */
-/* ENV CHECK                                                 */
+/* CLIENT INITIALIZATION                                     */
 /* ========================================================= */
-const REQUIRED_ENVS = [
-  "SUPABASE_URL",
-  "SUPABASE_SERVICE_ROLE_KEY",
-  "API_KEY", // Standardized to Guideline requirement
-  "WORKER_SECRET",
-];
 
-for (const key of REQUIRED_ENVS) {
-  if (!process.env[key]) {
-    console.error(`❌ Missing env var: ${key}`);
-    process.exit(1);
-  }
-}
-
-/* ========================================================= */
-/* CLIENTS                                                   */
-/* ========================================================= */
+// We initialize these here, but we will validate their existence 
+// inside the handlers to avoid crashing the container on boot.
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 );
 
 // Initialization strictly follows SDK guidelines
@@ -38,16 +24,38 @@ const ai = new GoogleGenAI({
 });
 
 /* ========================================================= */
-/* HEALTH CHECK                                              */
+/* HEALTH CHECK & STARTUP                                    */
 /* ========================================================= */
+
+// CRITICAL FOR CLOUD RUN: Bind to the port immediately.
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 Neural Worker active on port ${PORT}`);
+  
+  // Log status of environment variables without exiting
+  const REQUIRED_ENVS = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "API_KEY", "WORKER_SECRET"];
+  REQUIRED_ENVS.forEach(key => {
+    if (!process.env[key]) {
+      console.warn(`⚠️ Warning: Missing environment variable [${key}]. Requests will fail.`);
+    }
+  });
+});
+
 app.get("/", (_, res) => res.send("OK"));
 
 /* ========================================================= */
 /* JOB WORKER ENDPOINT (PROTECTED)                           */
 /* ========================================================= */
 app.post("/process", async (req, res) => {
-  if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
-    return res.sendStatus(401);
+  // Validate secret
+  if (!process.env.WORKER_SECRET || req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
+    return res.status(401).send("UNAUTHORIZED_ACCESS");
+  }
+
+  // Ensure essential services are configured before proceeding
+  if (!process.env.API_KEY || !process.env.SUPABASE_URL) {
+    console.error("❌ Process aborted: Server is missing configuration (API_KEY or SUPABASE_URL)");
+    return res.status(500).send("SERVER_CONFIGURATION_ERROR");
   }
 
   let job;
@@ -129,7 +137,7 @@ async function generateImage(job) {
   const input = job.input;
   let model = input.config.model;
 
-  // Normalizing Model Names for Pro vs Flash
+  // Normalizing Model Names
   if (model.includes("nano") && model.includes("pro")) {
     model = "gemini-3-pro-image-preview";
   } else if (model.includes("flash") || model.includes("elite")) {
@@ -169,11 +177,10 @@ async function generateImage(job) {
     }
   };
 
-  // imageSize is EXCLUSIVE to Pro and must be 1K, 2K, or 4K
   if (isPro) {
     let size = String(input.config.imageSize || "1K").toUpperCase();
     if (!["1K", "2K", "4K"].includes(size)) {
-      size = "1K"; // Fallback for stability
+      size = "1K";
     }
     config.imageConfig.imageSize = size;
   }
@@ -187,7 +194,6 @@ async function generateImage(job) {
   let imageBase64;
   let mimeType = "image/png";
 
-  // Pro results often contain multiple parts (text thoughts + image data)
   for (const part of response.candidates?.[0]?.content?.parts ?? []) {
     if (part.inlineData) {
       imageBase64 = part.inlineData.data;
@@ -222,11 +228,3 @@ async function generateImage(job) {
     storagePath: path
   };
 }
-
-/* ========================================================= */
-/* SERVER START                                              */
-/* ========================================================= */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Neural Worker listening on port ${PORT}`);
-});
