@@ -5,163 +5,153 @@ import { GoogleGenAI } from "@google/genai";
 import crypto from "crypto";
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 /* ========================================================= */
-/* ENV CHECK                                                 */
-/* ========================================================= */
-const REQUIRED_ENVS = [
-  "SUPABASE_URL",
-  "SUPABASE_SERVICE_ROLE_KEY",
-  "API_KEY", // Standardized to Guideline requirement
-  "WORKER_SECRET",
-];
-
-for (const key of REQUIRED_ENVS) {
-  if (!process.env[key]) {
-    console.error(`❌ Missing env var: ${key}`);
-    process.exit(1);
-  }
-}
-
-/* ========================================================= */
-/* CLIENTS                                                   */
+/* CLIENT INITIALIZATION                                     */
 /* ========================================================= */
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 );
 
-// Initialization strictly follows SDK guidelines
 const ai = new GoogleGenAI({
   apiKey: process.env.API_KEY,
 });
 
 /* ========================================================= */
-/* HEALTH CHECK                                              */
+/* HEALTH CHECK & STARTUP                                    */
 /* ========================================================= */
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 Neural Worker active on port ${PORT}`);
+  const REQUIRED_ENVS = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "API_KEY", "WORKER_SECRET"];
+  REQUIRED_ENVS.forEach(key => {
+    if (!process.env[key]) console.warn(`⚠️ Warning: Missing [${key}].`);
+  });
+});
+
 app.get("/", (_, res) => res.send("OK"));
 
 /* ========================================================= */
-/* JOB WORKER ENDPOINT (PROTECTED)                           */
+/* UTILITIES                                                 */
+/* ========================================================= */
+
+/**
+ * Exponential Backoff Utility
+ * Retries the AI call if the model is overloaded (503) or rate limited (429).
+ */
+async function callGeminiWithRetry(fn, maxRetries = 3) {
+  let lastError;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const status = err?.status || err?.response?.status;
+      
+      // Only retry on transient errors (503: Overloaded, 429: Rate Limit)
+      if (status === 503 || status === 429) {
+        const delay = Math.pow(2, i) * 2000; // 2s, 4s, 8s
+        console.warn(`⏳ Neural Node busy (Status ${status}). Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      // Hard failure (400, 401, 403, 404, etc.) - break loop
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
+/* ========================================================= */
+/* JOB WORKER ENDPOINT                                       */
 /* ========================================================= */
 app.post("/process", async (req, res) => {
-  if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
-    return res.sendStatus(401);
+  if (!process.env.WORKER_SECRET || req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
+    return res.status(401).send("UNAUTHORIZED");
   }
 
   let job;
 
   try {
     const { data, error } = await supabase.rpc("claim_next_ai_job");
-
-    if (error) {
-      console.error("❌ Failed to claim job", error);
-      return res.sendStatus(500);
-    }
-
-    if (!data) return res.sendStatus(204);
+    if (error || !data) return res.sendStatus(error ? 500 : 204);
 
     job = data;
-    console.log(`▶ Processing job ${job.id}`);
+    console.log(`▶ Processing job ${job.id} for user ${job.user_id}`);
 
-    if (job.type !== "generate-image") {
-      throw new Error("UNKNOWN_JOB_TYPE");
-    }
+    if (job.type !== "generate-image") throw new Error("UNKNOWN_JOB_TYPE");
 
     const result = await generateImage(job);
 
     await supabase
       .from("ai_jobs")
-      .update({
-        status: "completed",
-        result,
-      })
+      .update({ status: "completed", result })
       .eq("id", job.id);
 
-    console.log(`✅ Job ${job.id} completed`);
+    console.log(`✅ Job ${job.id} completed successfully`);
     return res.sendStatus(200);
 
   } catch (err) {
     const status = err?.status || err?.response?.status;
-    console.error("🔥 Job error", err);
+    console.error("🔥 Job execution failed:", err.message || err);
 
+    // If retries failed and it's still 503, refund credits
     if (status === 503 && job) {
-      const { data: cancelledJob } = await supabase
+      console.log(`♻️ Refunding user ${job.user_id} due to persistent 503 error.`);
+      await supabase
         .from("ai_jobs")
-        .update({
-          status: "cancelled",
-          error: "Model overloaded — credits refunded",
-        })
-        .eq("id", job.id)
-        .eq("status", "processing")
-        .select()
-        .single();
+        .update({ status: "cancelled", error: "Engine saturated - credits restored." })
+        .eq("id", job.id);
 
-      if (cancelledJob) {
-        await supabase.rpc("refund_user_credits", {
-          p_user_id: job.user_id,
-          p_credits: job.credits_used,
-        });
-      }
-
+      await supabase.rpc("refund_user_credits", {
+        p_user_id: job.user_id,
+        p_credits: job.credits_used,
+      });
       return res.sendStatus(200);
     }
 
     if (job) {
       await supabase
         .from("ai_jobs")
-        .update({
-          status: "failed",
-          error: String(err),
-        })
+        .update({ status: "failed", error: String(err.message || err) })
         .eq("id", job.id);
     }
 
-    return res.sendStatus(500);
+    return res.status(500).send(err.message || "INTERNAL_ERROR");
   }
 });
 
 /* ========================================================= */
-/* IMAGE GENERATION (INPUT FROM STORAGE)                     */
+/* IMAGE GENERATION LOGIC                                    */
 /* ========================================================= */
 async function generateImage(job) {
   const input = job.input;
   let model = input.config.model;
 
-  // Normalizing Model Names for Pro vs Flash
-  if (model.includes("nano") && model.includes("pro")) {
+  // Normalize model string
+  if (model.includes("pro")) {
     model = "gemini-3-pro-image-preview";
-  } else if (model.includes("flash") || model.includes("elite")) {
+  } else {
     model = "gemini-2.5-flash-image";
   }
 
-  console.log("🧠 Targeting Neural Node:", model);
+  console.log("🧠 Invoking model:", model);
 
   const parts = [{ text: input.prompt }];
 
-  /* LOAD REFERENCE IMAGES FROM STORAGE */
+  /* Reference Assets Ingestion */
   if (input.referenceImages?.length) {
     for (const ref of input.referenceImages) {
-      const { data, error } = await supabase.storage
-        .from(ref.bucket)
-        .download(ref.path);
-
+      const { data, error } = await supabase.storage.from(ref.bucket).download(ref.path);
       if (error) throw error;
-
-      const buffer = Buffer.from(await data.arrayBuffer());
-      const base64 = buffer.toString("base64");
-
-      parts.push({
-        inlineData: {
-          mimeType: ref.mime || "image/png",
-          data: base64,
-        },
-      });
+      const base64 = Buffer.from(await data.arrayBuffer()).toString("base64");
+      parts.push({ inlineData: { mimeType: ref.mime || "image/png", data: base64 } });
     }
   }
 
-  /* BUILD ENHANCED CONFIG FOR PRO */
+  /* Configuration Matrix */
   const isPro = model.includes("pro");
   const config = {
     imageConfig: {
@@ -169,25 +159,24 @@ async function generateImage(job) {
     }
   };
 
-  // imageSize is EXCLUSIVE to Pro and must be 1K, 2K, or 4K
   if (isPro) {
     let size = String(input.config.imageSize || "1K").toUpperCase();
-    if (!["1K", "2K", "4K"].includes(size)) {
-      size = "1K"; // Fallback for stability
-    }
+    if (!["1K", "2K", "4K"].includes(size)) size = "1K";
     config.imageConfig.imageSize = size;
   }
 
-  const response = await ai.models.generateContent({
-    model,
-    contents: { parts },
-    config
-  });
+  /* Execution with Retry logic */
+  const response = await callGeminiWithRetry(() => 
+    ai.models.generateContent({
+      model,
+      contents: { parts },
+      config
+    })
+  );
 
   let imageBase64;
   let mimeType = "image/png";
 
-  // Pro results often contain multiple parts (text thoughts + image data)
   for (const part of response.candidates?.[0]?.content?.parts ?? []) {
     if (part.inlineData) {
       imageBase64 = part.inlineData.data;
@@ -196,37 +185,17 @@ async function generateImage(job) {
     }
   }
 
-  if (!imageBase64) throw new Error("NO_IMAGE_BUFFER: Synthesis failed to return pixel data.");
+  if (!imageBase64) throw new Error("EMPTY_DATA_BUFFER: Synthesis failed to materialize pixels.");
 
-  /* STORE OUTPUT IMAGE */
+  /* Storage Persistence */
   const buffer = Buffer.from(imageBase64, "base64");
-  const ext = mimeType.split("/")[1] || "png";
-  const fileName = `${crypto.randomUUID()}.${ext}`;
+  const fileName = `${crypto.randomUUID()}.${mimeType.split("/")[1] || "png"}`;
   const path = `users/${job.user_id}/renders/${fileName}`;
 
-  await supabase.storage
-    .from("user_assets")
-    .upload(path, buffer, {
-      contentType: mimeType,
-      upsert: false,
-    });
+  await supabase.storage.from("user_assets").upload(path, buffer, { contentType: mimeType });
 
-  const { data, error } = await supabase.storage
-    .from("user_assets")
-    .createSignedUrl(path, 60 * 5);
-
+  const { data, error } = await supabase.storage.from("user_assets").createSignedUrl(path, 60 * 15);
   if (error) throw error;
 
-  return {
-    imageUrl: data.signedUrl,
-    storagePath: path
-  };
+  return { imageUrl: data.signedUrl, storagePath: path };
 }
-
-/* ========================================================= */
-/* SERVER START                                              */
-/* ========================================================= */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Neural Worker listening on port ${PORT}`);
-});
