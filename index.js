@@ -1,3 +1,4 @@
+
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI } from "@google/genai";
@@ -7,20 +8,42 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 /* ========================================================= */
-/* CLIENTS & ENV                                             */
+/* ENV CHECK                                                 */
+/* ========================================================= */
+const REQUIRED_ENVS = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "API_KEY", // Standardized to Guideline requirement
+  "WORKER_SECRET",
+];
+
+for (const key of REQUIRED_ENVS) {
+  if (!process.env[key]) {
+    console.error(`❌ Missing env var: ${key}`);
+    process.exit(1);
+  }
+}
+
+/* ========================================================= */
+/* CLIENTS                                                   */
 /* ========================================================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Note: Ensure you are using the @google/genai SDK (not @google/generative-ai)
+// Initialization strictly follows SDK guidelines
 const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+  apiKey: process.env.API_KEY,
 });
 
 /* ========================================================= */
-/* WORKER ENDPOINT                                           */
+/* HEALTH CHECK                                              */
+/* ========================================================= */
+app.get("/", (_, res) => res.send("OK"));
+
+/* ========================================================= */
+/* JOB WORKER ENDPOINT (PROTECTED)                           */
 /* ========================================================= */
 app.post("/process", async (req, res) => {
   if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
@@ -28,94 +51,182 @@ app.post("/process", async (req, res) => {
   }
 
   let job;
+
   try {
     const { data, error } = await supabase.rpc("claim_next_ai_job");
-    if (error || !data) return res.sendStatus(error ? 500 : 204);
-    job = data;
 
-    console.log(`▶ Processing ${job.id} with ${job.input.config.model}`);
-
-    const result = await generateBananaImage(job);
-
-    await supabase.from("ai_jobs").update({
-      status: "completed",
-      result,
-    }).eq("id", job.id);
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("🔥 Job Failed:", err);
-    if (job) {
-      await supabase.from("ai_jobs").update({
-        status: "failed",
-        error: String(err),
-      }).eq("id", job.id);
+    if (error) {
+      console.error("❌ Failed to claim job", error);
+      return res.sendStatus(500);
     }
+
+    if (!data) return res.sendStatus(204);
+
+    job = data;
+    console.log(`▶ Processing job ${job.id}`);
+
+    if (job.type !== "generate-image") {
+      throw new Error("UNKNOWN_JOB_TYPE");
+    }
+
+    const result = await generateImage(job);
+
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "completed",
+        result,
+      })
+      .eq("id", job.id);
+
+    console.log(`✅ Job ${job.id} completed`);
+    return res.sendStatus(200);
+
+  } catch (err) {
+    const status = err?.status || err?.response?.status;
+    console.error("🔥 Job error", err);
+
+    if (status === 503 && job) {
+      const { data: cancelledJob } = await supabase
+        .from("ai_jobs")
+        .update({
+          status: "cancelled",
+          error: "Model overloaded — credits refunded",
+        })
+        .eq("id", job.id)
+        .eq("status", "processing")
+        .select()
+        .single();
+
+      if (cancelledJob) {
+        await supabase.rpc("refund_user_credits", {
+          p_user_id: job.user_id,
+          p_credits: job.credits_used,
+        });
+      }
+
+      return res.sendStatus(200);
+    }
+
+    if (job) {
+      await supabase
+        .from("ai_jobs")
+        .update({
+          status: "failed",
+          error: String(err),
+        })
+        .eq("id", job.id);
+    }
+
     return res.sendStatus(500);
   }
 });
 
 /* ========================================================= */
-/* NANO BANANA GENERATION LOGIC                              */
+/* IMAGE GENERATION (INPUT FROM STORAGE)                     */
 /* ========================================================= */
-async function generateBananaImage(job) {
-  const { prompt, config, referenceImages } = job.input;
-  
-  // 1. Prepare contents (Text + optional Reference Images)
-  const parts = [{ text: prompt }];
+async function generateImage(job) {
+  const input = job.input;
+  let model = input.config.model;
 
-  if (referenceImages?.length) {
-    for (const ref of referenceImages) {
-      const { data, error } = await supabase.storage.from(ref.bucket).download(ref.path);
+  // Normalizing Model Names for Pro vs Flash
+  if (model.includes("nano") && model.includes("pro")) {
+    model = "gemini-3-pro-image-preview";
+  } else if (model.includes("flash") || model.includes("elite")) {
+    model = "gemini-2.5-flash-image";
+  }
+
+  console.log("🧠 Targeting Neural Node:", model);
+
+  const parts = [{ text: input.prompt }];
+
+  /* LOAD REFERENCE IMAGES FROM STORAGE */
+  if (input.referenceImages?.length) {
+    for (const ref of input.referenceImages) {
+      const { data, error } = await supabase.storage
+        .from(ref.bucket)
+        .download(ref.path);
+
       if (error) throw error;
-      
+
+      const buffer = Buffer.from(await data.arrayBuffer());
+      const base64 = buffer.toString("base64");
+
       parts.push({
         inlineData: {
           mimeType: ref.mime || "image/png",
-          data: Buffer.from(await data.arrayBuffer()).toString("base64"),
+          data: base64,
         },
       });
     }
   }
 
-  // 2. Execute call using generateContent (Native Modality)
+  /* BUILD ENHANCED CONFIG FOR PRO */
+  const isPro = model.includes("pro");
+  const config = {
+    imageConfig: {
+      aspectRatio: input.config.aspectRatio || "1:1",
+    }
+  };
+
+  // imageSize is EXCLUSIVE to Pro and must be 1K, 2K, or 4K
+  if (isPro) {
+    let size = String(input.config.imageSize || "1K").toUpperCase();
+    if (!["1K", "2K", "4K"].includes(size)) {
+      size = "1K"; // Fallback for stability
+    }
+    config.imageConfig.imageSize = size;
+  }
+
   const response = await ai.models.generateContent({
-    model: config.model || "gemini-3-pro-image-preview",
-    contents: [{ role: "user", parts }],
-    config: {
-      // CRITICAL: Tells the model to generate an image
-      responseModalities: ["IMAGE"], 
-      imageConfig: {
-        aspectRatio: config.aspectRatio || "1:1",
-        // Pro supports "2K" or "4K", Flash usually defaults to 1K
-        imageSize: config.imageSize || "1K", 
-      }
-    },
+    model,
+    contents: { parts },
+    config
   });
 
-  // 3. Extract the generated image from response parts
   let imageBase64;
-  for (const part of response.candidates?.[0]?.content?.parts || []) {
+  let mimeType = "image/png";
+
+  // Pro results often contain multiple parts (text thoughts + image data)
+  for (const part of response.candidates?.[0]?.content?.parts ?? []) {
     if (part.inlineData) {
       imageBase64 = part.inlineData.data;
+      mimeType = part.inlineData.mimeType;
       break;
     }
   }
 
-  if (!imageBase64) throw new Error("Model failed to return image data");
+  if (!imageBase64) throw new Error("NO_IMAGE_BUFFER: Synthesis failed to return pixel data.");
 
-  // 4. Upload to Supabase
+  /* STORE OUTPUT IMAGE */
   const buffer = Buffer.from(imageBase64, "base64");
-  const fileName = `${crypto.randomUUID()}.png`;
+  const ext = mimeType.split("/")[1] || "png";
+  const fileName = `${crypto.randomUUID()}.${ext}`;
   const path = `users/${job.user_id}/renders/${fileName}`;
 
-  await supabase.storage.from("user_assets").upload(path, buffer, {
-    contentType: "image/png",
-  });
+  await supabase.storage
+    .from("user_assets")
+    .upload(path, buffer, {
+      contentType: mimeType,
+      upsert: false,
+    });
 
-  const { data } = await supabase.storage.from("user_assets").createSignedUrl(path, 300);
+  const { data, error } = await supabase.storage
+    .from("user_assets")
+    .createSignedUrl(path, 60 * 5);
 
-  return { image_url: data.signedUrl };
+  if (error) throw error;
+
+  return {
+    imageUrl: data.signedUrl,
+    storagePath: path
+  };
 }
 
-app.listen(8080);
+/* ========================================================= */
+/* SERVER START                                              */
+/* ========================================================= */
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 Neural Worker listening on port ${PORT}`);
+});
