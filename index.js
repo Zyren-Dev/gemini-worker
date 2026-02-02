@@ -170,6 +170,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
         file_name: fileName,
         file_size: fileBuffer.length,
         mime_type: "image/png",
+        asset_category: "render", // NEW: Classify as AI Render
         status: "active"
     });
     if (dbError) console.error("Failed to register render in user_files:", dbError);
