@@ -104,13 +104,18 @@ async function generateImage(job, overridePrompt, overrideConfig) {
     }
     console.log(`🧠 Calling Gemini API (${modelName})...`);
     // Config specifically for Gemini 3 Pro Image (Nano Banana)
-    const generationConfig = {
-        responseModalities: ["IMAGE"], // REQUIRED for Gemini 3 Image Gen
-        imageConfig: {
-            aspectRatio: config.aspectRatio || "1:1",
-            imageSize: "1K" // Gemini 3 supports 2K/4K but sticking to 1K for safety/speed first
-        }
-    };
+    let generationConfig = undefined;
+    if (modelName === "gemini-3-pro-image-preview") {
+        generationConfig = {
+            responseModalities: ["TEXT", "IMAGE"], // Documented requirement
+            imageConfig: {
+                aspectRatio: config.aspectRatio || "1:1",
+                imageSize: "1K"
+            }
+        };
+    }
+    // Note: Gemini 2.5 Flash Image appears to reject imageConfig/responseModalities 
+    // and works with default parameters according to docs.
     const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
             model: modelName,
