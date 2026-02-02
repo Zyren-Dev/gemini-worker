@@ -87,6 +87,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
     const input = job.input;
     const prompt = overridePrompt || input.prompt;
     const config = overrideConfig || input.config;
+    // REVERTED: User was correct! These are the new Nano Banana models.
     const modelName = config.model?.includes("pro") ? "gemini-3-pro-image-preview" : "gemini-2.5-flash-image";
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const parts = [{ text: prompt }];
@@ -101,12 +102,20 @@ async function generateImage(job, overridePrompt, overrideConfig) {
             parts.push({ inlineData: { mimeType: ref.mime || "image/png", data: base64 } });
         }
     }
-    console.log("🧠 Calling Gemini API...");
+    console.log(`🧠 Calling Gemini API (${modelName})...`);
+    // Config specifically for Gemini 3 Pro Image (Nano Banana)
+    const generationConfig = {
+        responseModalities: ["IMAGE"], // REQUIRED for Gemini 3 Image Gen
+        imageConfig: {
+            aspectRatio: config.aspectRatio || "1:1",
+            imageSize: "1K" // Gemini 3 supports 2K/4K but sticking to 1K for safety/speed first
+        }
+    };
     const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
             model: modelName,
             contents: { parts },
-            config: { imageConfig: { aspectRatio: config.aspectRatio || "1:1", imageSize: "1K" } }
+            config: generationConfig
         }), true
     );
     console.log("✅ Gemini Success. Extracting Data...");
