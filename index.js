@@ -30,17 +30,22 @@ app.get("/", (_, res) => res.send("OK"));
 /* UTILITIES                                                 */
 /* ========================================================= */
 async function callGeminiWithRetry(fn, isPro = false) {
-    const maxRetries = isPro ? 6 : 3;
+    const maxRetries = 3; // Reduced from 6 to fail faster during debug
     const baseDelay = isPro ? 5000 : 2000;
     for (let i = 0; i < maxRetries; i++) {
-        try { return await fn(); }
+        try {
+            return await fn();
+        }
         catch (err) {
-            if (err.status === 503 || err.status === 429) {
+            console.warn(`⚠️ API Attempt ${i + 1}/${maxRetries} failed: ${err.status || err.message}`);
+            if (i === maxRetries - 1) throw err; // Re-throw on last attempt
+            if (err.status === 503 || err.status === 429 || err.status === 500) {
                 const delay = (Math.pow(2, i) * baseDelay) + (Math.random() * 2000);
+                console.log(`⏳ Waiting ${Math.round(delay)}ms before retry...`);
                 await new Promise(r => setTimeout(r, delay));
                 continue;
             }
-            throw err;
+            throw err; // verification failed, rethrow immediately for other errors
         }
     }
 }
