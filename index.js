@@ -144,7 +144,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
         user_id: job.user_id,
         file_id: crypto.randomUUID(), // or let DB auto-gen if using uuid_generate_v4()
         r2_key: r2Key,
-        filename: fileName,
+        file_name: fileName, // CORRECTED: schema uses 'file_name' vs code 'filename'
         file_size: fileBuffer.length,
         mime_type: "image/png",
         status: "active"
