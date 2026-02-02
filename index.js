@@ -92,12 +92,16 @@ async function generateImage(job, overridePrompt, overrideConfig) {
     const parts = [{ text: prompt }];
     // Handle References (Download from R2)
     if (input.referenceImages?.length && !overridePrompt) {
+        console.log("⬇️ Downloading Reference Images from R2...");
         for (const ref of input.referenceImages) {
             // ref.path should be the R2 Key (e.g. users/123/file.png)
+            console.log(`   Downloading ${ref.path}...`);
             const base64 = await downloadFromR2(ref.path);
+            console.log(`   Download complete.`);
             parts.push({ inlineData: { mimeType: ref.mime || "image/png", data: base64 } });
         }
     }
+    console.log("🧠 Calling Gemini API...");
     const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
             model: modelName,
@@ -105,6 +109,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
             config: { imageConfig: { aspectRatio: config.aspectRatio || "1:1", imageSize: "1K" } }
         }), true
     );
+    console.log("✅ Gemini Success. Extracting Data...");
     const base64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64) throw new Error("No image generated");
     // Upload to R2
@@ -112,12 +117,14 @@ async function generateImage(job, overridePrompt, overrideConfig) {
     const fileName = `${crypto.randomUUID()}.${extension}`;
     const r2Key = `users/${job.user_id}/renders/${fileName}`;
     const fileBuffer = Buffer.from(base64, "base64");
+    console.log(`⬆️ Uploading Result to R2 (${r2Key})...`);
     await r2.send(new PutObjectCommand({
         Bucket: R2_BUCKET,
         Key: r2Key,
         Body: fileBuffer,
         ContentType: "image/png",
     }));
+    console.log("✅ Upload Complete.");
     // Register in user_files DB (Important for Library visibility!)
     const { error: dbError } = await supabase.from("user_files").insert({
         user_id: job.user_id,
