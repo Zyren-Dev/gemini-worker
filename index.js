@@ -124,8 +124,11 @@ async function generateImage(job, overridePrompt, overrideConfig) {
         }), true
     );
     console.log("✅ Gemini Success. Extracting Data...");
-    const base64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64) throw new Error("No image generated");
+    // Parse parts to find the image (Gemini 3 might return text first!)
+    const partsList = response.candidates?.[0]?.content?.parts || [];
+    const imagePart = partsList.find(p => p.inlineData && p.inlineData.data);
+    const base64 = imagePart?.inlineData?.data;
+    if (!base64) throw new Error("No image generated (Check text output in logs if available)");
     // Upload to R2
     const extension = "png";
     const fileName = `${crypto.randomUUID()}.${extension}`;
@@ -140,11 +143,12 @@ async function generateImage(job, overridePrompt, overrideConfig) {
     }));
     console.log("✅ Upload Complete.");
     // Register in user_files DB (Important for Library visibility!)
+    // Register in user_files DB (Important for Library visibility!)
     const { error: dbError } = await supabase.from("user_files").insert({
         user_id: job.user_id,
-        file_id: crypto.randomUUID(), // or let DB auto-gen if using uuid_generate_v4()
+        file_id: crypto.randomUUID(),
         r2_key: r2Key,
-        file_name: fileName, // CORRECTED: schema uses 'file_name' vs code 'filename'
+        file_name: fileName,
         file_size: fileBuffer.length,
         mime_type: "image/png",
         status: "active"
