@@ -129,7 +129,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
             responseModalities: ["TEXT", "IMAGE"], // Documented requirement
             imageConfig: {
                 aspectRatio: config.aspectRatio || "1:1",
-                imageSize: "1K"
+                imageSize: config.imageSize || "1K"
             }
         };
     }
