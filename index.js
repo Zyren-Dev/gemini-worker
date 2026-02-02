@@ -81,7 +81,21 @@ app.post("/process", async (req, res) => {
         return res.sendStatus(200);
     } catch (err) {
         console.error("🔥 Fault:", err.message);
-        if (job) await supabase.from("ai_jobs").update({ status: "failed", error: err.message }).eq("id", job.id);
+        if (job) {
+            // 1. Mark Job Failed
+            await supabase.from("ai_jobs").update({ status: "failed", error: err.message }).eq("id", job.id);
+            // 2. Refund Credits (User requested this specific behavior)
+            // Assuming 'refund_credits' RPC exists and mirrors 'deduct_credits'
+            if (job.cost && job.cost > 0) {
+                console.log(`💸 Refunding ${job.cost} credits to user ${job.user_id}...`);
+                const { error: refundError } = await supabase.rpc("refund_credits", {
+                    p_user_id: job.user_id,
+                    p_amount: job.cost,
+                    p_metadata: { reason: "job_failed", error: err.message, job_id: job.id }
+                });
+                if (refundError) console.error("Refund failed:", refundError);
+            }
+        }
         return res.status(500).send(err.message);
     }
 });
