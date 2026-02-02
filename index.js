@@ -119,7 +119,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
     const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
             model: modelName,
-            contents: { parts },
+            contents: parts, // PASSED DIRECTLY (Array of Parts) matches User Snippet
             config: generationConfig
         }), true
     );
