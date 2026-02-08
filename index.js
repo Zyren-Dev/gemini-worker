@@ -29,7 +29,7 @@ const r2 = new S3Client({
 const R2_BUCKET = process.env.R2_BUCKET_NAME || "user-files";
 const PORT = process.env.PORT || 8080;
 
-app.listen(PORT, () => console.log(`🚀 Neural Worker (R2 Enabled) active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Neural Worker (Push Model) active on port ${PORT}`));
 
 app.get("/", (_, res) => res.send("OK"));
 
@@ -76,21 +76,41 @@ async function downloadFromR2(key) {
 /* JOB WORKER ENDPOINT                                       */
 /* ========================================================= */
 app.post("/process", async (req, res) => {
-    if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) return res.status(401).send("UNAUTHORIZED");
+    // Security Check
+    if (req.headers["x-worker-secret"] !== process.env.WORKER_SECRET) {
+        return res.status(401).send("UNAUTHORIZED");
+    }
 
-    let job;
+    let job = {}; // Initialize empty object
+
     try {
-        // Note: ensure your DB function is claiming correctly
-        const { data } = await supabase.rpc("claim_next_ai_job");
-        if (!data) return res.sendStatus(204);
+        // 1. Get Job from Request (Push Model)
+        // REPLACED: claim_next_ai_job with explicit payload from Edge Function
+        const { job_id, action, payload, user_id } = req.body;
 
-        job = data;
+        console.log(`▶ Received request for Job ${job_id} [${action}]`);
+
+        // 2. Validate Action (Prevent Video job processing)
+        if (action !== 'generate-image' && action !== 'analyze-material') {
+            console.warn(`⚠️ Ignoring unsupported action: ${action}`);
+            // Return 400 so the caller knows it sent it to the wrong place
+            return res.status(400).json({ error: `Unsupported action: ${action}` });
+        }
+
+        // 3. Construct Job Object (matching DB structure for internal logic)
+        job = {
+            id: job_id,
+            type: action,
+            input: payload,
+            user_id: user_id,
+            cost: 0 // We don't have cost here, but usually validation happens before payment deduction in the manager.
+        };
+
         console.log(`▶ Processing job ${job.id} [${job.type}]`);
 
         let result;
         if (job.type === "generate-image") result = await generateImage(job);
         else if (job.type === "analyze-material") result = await analyzeMaterial(job);
-        else throw new Error(`UNSUPPORTED: ${job.type}`);
 
         // FIX: Check for errors when updating ai_jobs!
         const { error: dbUpdateError } = await supabase.from("ai_jobs").update({ status: "completed", result }).eq("id", job.id);
@@ -105,12 +125,12 @@ app.post("/process", async (req, res) => {
 
     } catch (err) {
         console.error("🔥 Fault:", err.message);
-        if (job) {
+        if (job && job.id) {
             // 1. Mark Job Failed
             await supabase.from("ai_jobs").update({ status: "failed", error: err.message }).eq("id", job.id);
 
-            // 2. Refund Credits (User requested this specific behavior)
-            // Assuming 'refund_credits' RPC exists and mirrors 'deduct_credits'
+            // 2. Refund Credits 
+            // Only if we have cost info, otherwise relying on manual refund or separate process
             if (job.cost && job.cost > 0) {
                 console.log(`💸 Refunding ${job.cost} credits to user ${job.user_id}...`);
                 const { error: refundError } = await supabase.rpc("refund_credits", {
