@@ -295,3 +295,4 @@ app.post("/process", async (req: Request, res: Response): Promise<any> => {
 app.listen(PORT, () => console.log(`🚀 Neural Worker (Image) active on port ${PORT}`));
 
 app.get("/", (_, res) => res.send("OK"));
+
