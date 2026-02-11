@@ -233,7 +233,7 @@ app.post("/process", async (req: Request, res: Response): Promise<any> => {
 
     try {
         // 1. Get Job from Request (Push Model)
-        const { job_id, action, payload, user_id } = req.body;
+        const { job_id, action, payload, user_id, cost } = req.body;
 
         console.log(`▶ Received request for Job ${job_id} [${action}]`);
 
@@ -249,8 +249,7 @@ app.post("/process", async (req: Request, res: Response): Promise<any> => {
             type: action,
             input: payload,
             user_id: user_id,
-            cost: 0 // We don't have cost here, but refund logic might need it. 
-            // Ideally, cost is handled by the manager before dispatch.
+            cost: cost // Received from the manager
         };
 
         console.log(`▶ Processing job ${job.id} [${job.type}]`);
