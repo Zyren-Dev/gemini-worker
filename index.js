@@ -85,16 +85,23 @@ async function generateImage(job, overridePrompt, overrideConfig) {
             imageConfig: { aspectRatio: config.aspectRatio || "1:1" }
         };
     } else {
-        generationConfig = { responseModalities: ["IMAGE"] };
+        // FLASH: Imagen 3 (Flash) often requires imageConfig even if simple
+        generationConfig = {
+            responseModalities: ["IMAGE"],
+            imageConfig: { aspectRatio: config.aspectRatio || "1:1" }
+        };
     }
 
+    const isPro = modelName.includes("pro");
     const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
             model: modelName,
             contents: parts,
             config: generationConfig
-        }), true
+        }), isPro
     );
+
+    console.log("✅ Gemini Success. Extracting Data...");
 
     let base64;
     if (response.generatedImages && response.generatedImages.length > 0) {
@@ -105,7 +112,10 @@ async function generateImage(job, overridePrompt, overrideConfig) {
         base64 = imagePart?.inlineData?.data;
     }
 
-    if (!base64) throw new Error("No image generated");
+    if (!base64) {
+        console.error("🔍 NO IMAGE FOUND. FULL RESPONSE:", JSON.stringify(response, null, 2));
+        throw new Error("No image generated (Check logs for structure)");
+    }
 
     const extension = "png";
     const fileName = `${crypto.randomUUID()}.${extension}`;
