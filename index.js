@@ -259,11 +259,7 @@ app.post("/process", async (req: Request, res: Response): Promise<any> => {
         else if (job.type === "analyze-material") result = await analyzeMaterial(job);
 
         // FIX: Check for errors when updating ai_jobs!
-        const { error: dbUpdateError } = await supabase.from("ai_jobs").update({
-            status: "completed",
-            result,
-            updated_at: new Date().toISOString()
-        }).eq("id", job.id);
+        const { error: dbUpdateError } = await supabase.from("ai_jobs").update({ status: "completed", result }).eq("id", job.id);
 
         if (dbUpdateError) {
             console.error(`[Job ${job.id}] FAILED to update ai_jobs:`, dbUpdateError);
@@ -277,11 +273,7 @@ app.post("/process", async (req: Request, res: Response): Promise<any> => {
         console.error("🔥 Fault:", err.message);
         if (job) {
             // 1. Mark Job Failed
-            await supabase.from("ai_jobs").update({
-                status: "failed",
-                error: err.message,
-                updated_at: new Date().toISOString()
-            }).eq("id", job.id);
+            await supabase.from("ai_jobs").update({ status: "failed", error: err.message }).eq("id", job.id);
 
             // 2. Refund Credits (User requested this specific behavior)
             // Assuming 'refund_credits' RPC exists and mirrors 'deduct_credits'
