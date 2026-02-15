@@ -166,7 +166,7 @@ async function analyzeMaterial(job) {
 
     const textPart = analysisRes.candidates?.[0]?.content?.parts?.[0]?.text;
     const analysis = JSON.parse(textPart);
-    const previewPrompt = `Hyper-realistic detailed spherical material preview of ${analysis.name}. ${analysis.description}. Studio lighting, light gray background, 8k resolution.`;
+    const previewPrompt = `Hyper-realistic spherical material preview of ${analysis.name}. ${analysis.description}. Raytraced Studio lighting, light grey background, 8k resolution, microdetails.`;
     const previewResult = await generateImage(job, previewPrompt, { model: 'gemini-3-pro-image-preview', aspectRatio: '1:1' });
 
     return { analysis: analysis, previewUrl: previewResult.imageUrl };
