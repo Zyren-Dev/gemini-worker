@@ -149,7 +149,7 @@ async function generateImage(job, overridePrompt, overrideConfig) {
 async function analyzeMaterial(job) {
     const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY || process.env.API_KEY });
     const isPro = job.input.config?.model?.includes("pro");
-    const textModel = isPro ? "gemini-1.5-pro" : "gemini-1.5-flash";
+    const textModel = isPro ? "gemini-2.5-flash" : "gemini-1.5-flash";
     const ref = job.input.referenceImage;
 
     if (!ref || !ref.path) throw new Error("Missing reference image for analysis");
